@@ -43,6 +43,12 @@ pub struct DirectLDLKKTSolver<T> {
     // unpermuted KKT matrix
     KKT: CscMatrix<T>,
 
+    // full (untriangular) copy of KKT for parallel refinement residuals, with a map
+    // from full nzval index -> triu nzval index for lazy value refresh
+    KKTfull: CscMatrix<T>,
+    fullmap: Vec<usize>,
+    kktfull_stale: bool,
+
     // triangular storage shape for KKT
     KKTuplo: MatrixTriangle,
 
@@ -99,6 +105,8 @@ where
         // provided, the solver finds one for itself
         let ldlsolver = ldl_ctor(&KKT, &dsigns, settings, None);
 
+        let (KKTfull, fullmap) = _build_full_from_triangle(&KKT, kktshape);
+
         Self {
             m,
             n,
@@ -111,6 +119,9 @@ where
             dsigns,
             Hsblocks,
             KKT,
+            KKTfull,
+            fullmap,
+            kktfull_stale: true,
             KKTuplo: kktshape,
             ldlsolver,
             diagonal_regularizer,
@@ -154,6 +165,7 @@ where
             }
         }
 
+        self.kktfull_stale = true;
         self.regularize_and_refactor(settings)
     }
 
@@ -190,10 +202,12 @@ where
 
     fn update_P(&mut self, P: &CscMatrix<T>) {
         _update_values(&mut self.ldlsolver, &mut self.KKT, &self.map.P, &P.nzval);
+        self.kktfull_stale = true;
     }
 
     fn update_A(&mut self, A: &CscMatrix<T>) {
         _update_values(&mut self.ldlsolver, &mut self.KKT, &self.map.A, &A.nzval);
+        self.kktfull_stale = true;
     }
 }
 
@@ -264,6 +278,11 @@ where
     }
 
     fn iterative_refinement(&mut self, settings: &CoreSettings<T>) -> bool {
+        if self.kktfull_stale {
+            _refresh_full_values(&mut self.KKTfull, &self.fullmap, &self.KKT);
+            self.kktfull_stale = false;
+        }
+
         let (x, b) = (&mut self.x, &self.b);
         let (e, dx) = (&mut self.work1, &mut self.work2);
 
@@ -274,12 +293,12 @@ where
         let stopratio = settings.iterative_refinement_stop_ratio;
 
         let KKT = &self.KKT;
-        let KKTsym = KKT.sym(self.KKTuplo);
+        let KKTfull = &self.KKTfull;
 
         let normb = b.norm_inf();
 
         //compute the initial error
-        let mut norme = _get_refine_error(e, b, &KKTsym, x);
+        let mut norme = _get_refine_error(e, b, KKTfull, x);
 
         if !norme.is_finite() {
             return false;
@@ -300,7 +319,7 @@ where
             // hold it for a check before applying to x
             dx.axpby(T::one(), x, T::one());
 
-            norme = _get_refine_error(e, b, &KKTsym, dx);
+            norme = _get_refine_error(e, b, KKTfull, dx);
 
             if !norme.is_finite() {
                 return false;
@@ -334,16 +353,83 @@ fn _compute_regularizer<T: FloatT>(diag_kkt: &[T], settings: &CoreSettings<T>) -
 fn _get_refine_error<T: FloatT>(
     e: &mut [T],
     b: &[T],
-    KKTsym: &Symmetric<CscMatrix<T>>,
+    KKTfull: &CscMatrix<T>,
     ξ: &mut [T],
 ) -> T {
-    // Note that K is only triu data, so need to
-    // be careful when computing the residual here
+    // KKTfull holds the full (not triangular) symmetric matrix, so each column j of the CSC
+    // is also row j: the residual is a conflict-free per-row gather, parallelized over rows.
+    use rayon::prelude::*;
 
-    e.copy_from(b);
-    KKTsym.symv(e, ξ, -T::one(), T::one()); //#  e = b - Kξ
+    let colptr = &KKTfull.colptr;
+    let rowval = &KKTfull.rowval;
+    let nzval = &KKTfull.nzval;
+    let xi: &[T] = ξ;
+
+    e.par_iter_mut().enumerate().for_each(|(j, ej)| {
+        let mut s = T::zero();
+        for idx in colptr[j]..colptr[j + 1] {
+            s += nzval[idx] * xi[rowval[idx]];
+        }
+        *ej = b[j] - s;
+    });
 
     e.norm_inf()
+}
+
+// Build the full symmetric CSC matrix from triangular data, together with a map from each
+// full-matrix nzval index back to the source triangular nzval index (for value refresh).
+fn _build_full_from_triangle<T: FloatT>(
+    K: &CscMatrix<T>,
+    _uplo: MatrixTriangle,
+) -> (CscMatrix<T>, Vec<usize>) {
+    let n = K.n;
+    let mut counts = vec![0usize; n];
+    for col in 0..n {
+        for idx in K.colptr[col]..K.colptr[col + 1] {
+            let row = K.rowval[idx];
+            counts[col] += 1;
+            if row != col {
+                counts[row] += 1;
+            }
+        }
+    }
+
+    let mut colptr = vec![0usize; n + 1];
+    for i in 0..n {
+        colptr[i + 1] = colptr[i] + counts[i];
+    }
+    let nnz = colptr[n];
+
+    let mut rowval = vec![0usize; nnz];
+    let mut fullmap = vec![0usize; nnz];
+    let mut pos = colptr.clone();
+    for col in 0..n {
+        for idx in K.colptr[col]..K.colptr[col + 1] {
+            let row = K.rowval[idx];
+            rowval[pos[col]] = row;
+            fullmap[pos[col]] = idx;
+            pos[col] += 1;
+            if row != col {
+                rowval[pos[row]] = col;
+                fullmap[pos[row]] = idx;
+                pos[row] += 1;
+            }
+        }
+    }
+
+    let full = CscMatrix::new(n, n, colptr, rowval, vec![T::zero(); nnz]);
+    (full, fullmap)
+}
+
+fn _refresh_full_values<T: FloatT>(KKTfull: &mut CscMatrix<T>, fullmap: &[usize], KKT: &CscMatrix<T>) {
+    use rayon::prelude::*;
+
+    let src = &KKT.nzval;
+    KKTfull
+        .nzval
+        .par_iter_mut()
+        .zip(fullmap.par_iter())
+        .for_each(|(v, &i)| *v = src[i]);
 }
 
 // update entries of the KKT matrix using the given index into its CSC representation.
