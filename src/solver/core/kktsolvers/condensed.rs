@@ -45,6 +45,16 @@ struct SocScaling<T> {
     rng: Range<usize>,
     ub: Vec<T>,
     vb: Vec<T>,
+    // sequential Sherman-Morrison cache for H_block = E + ub ub' - vb vb':
+    //   eu = E^{-1} ub,  d1 = 1 + ub' eu   (update; d1 >= 1 by construction)
+    //   hv = B1^{-1} vb, d2 = 1 - vb' hv   (downdate; d2 > 0 since H is PD)
+    // splitting the rank-2 into two signed rank-1 terms keeps every
+    // denominator positive and cancellation-free, unlike the coupled 2x2
+    // form whose core (J + S) can pass arbitrarily close to singularity
+    eu: Vec<T>,
+    hv: Vec<T>,
+    d1: T,
+    d2: T,
 }
 
 // copy of one dense-form SOC scaling (w point and eta^2); the block and its
@@ -300,6 +310,10 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             .map(|rng| SocScaling {
                 ub: vec![T::zero(); rng.len()],
                 vb: vec![T::zero(); rng.len()],
+                eu: vec![T::zero(); rng.len()],
+                hv: vec![T::zero(); rng.len()],
+                d1: T::one(),
+                d2: T::one(),
                 rng,
             })
             .collect();
@@ -552,29 +566,22 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             z[r] = self.dinv[r] * w[r];
         }
         for soc in &self.socs {
-            // block = E + ub ub' - vb vb'; SMW with 2x2 core J + G'E^{-1}G
-            let mut s_uu = T::zero();
-            let mut s_uv = T::zero();
-            let mut s_vv = T::zero();
-            let mut t_u = T::zero();
-            let mut t_v = T::zero();
+            // sequential Sherman-Morrison: z = B1^{-1} w then downdate
+            let mut a1 = T::zero();
             for (i, r) in soc.rng.clone().enumerate() {
-                let di = self.dinv[r];
-                s_uu += soc.ub[i] * di * soc.ub[i];
-                s_uv += soc.ub[i] * di * soc.vb[i];
-                s_vv += soc.vb[i] * di * soc.vb[i];
-                t_u += soc.ub[i] * di * w[r];
-                t_v += soc.vb[i] * di * w[r];
+                a1 += soc.ub[i] * z[r]; // ub' E^{-1} w  (z holds E^{-1} w here)
             }
-            let a = T::one() + s_uu;
-            let b = s_uv;
-            let c2 = s_uv;
-            let d2 = -T::one() + s_vv;
-            let det = a * d2 - b * c2;
-            let cu = (d2 * t_u - b * t_v) / det;
-            let cv = (-c2 * t_u + a * t_v) / det;
+            a1 = a1 / soc.d1;
             for (i, r) in soc.rng.clone().enumerate() {
-                z[r] -= self.dinv[r] * (soc.ub[i] * cu + soc.vb[i] * cv);
+                z[r] -= soc.eu[i] * a1;
+            }
+            let mut a2 = T::zero();
+            for (i, r) in soc.rng.clone().enumerate() {
+                a2 += soc.vb[i] * z[r]; // vb' B1^{-1} w
+            }
+            a2 = a2 / soc.d2;
+            for (i, r) in soc.rng.clone().enumerate() {
+                z[r] += soc.hv[i] * a2;
             }
         }
         for ds in &self.dense_socs {
@@ -687,6 +694,33 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
     fn update(&mut self, cones: &CompositeCone<T>, _settings: &CoreSettings<T>) -> bool {
         self.refresh_scalings(cones);
 
+        // sequential-SM cache per sparse SOC (see SocScaling). d2 must be
+        // significantly positive: H is PD in exact arithmetic, so a computed
+        // d2 at rounding-noise scale means the downdate is not resolvable in
+        // f64 and we decline the update (caller falls back).
+        for si in 0..self.socs.len() {
+            let soc = &mut self.socs[si];
+            let mut d1 = T::one();
+            for (i, r) in soc.rng.clone().enumerate() {
+                soc.eu[i] = self.dinv[r] * soc.ub[i];
+                d1 += soc.ub[i] * soc.eu[i];
+            }
+            soc.d1 = d1;
+            let mut t = T::zero();
+            for (i, _r) in soc.rng.clone().enumerate() {
+                t += soc.vb[i] * soc.eu[i];
+            }
+            let mut d2 = T::one();
+            for (i, r) in soc.rng.clone().enumerate() {
+                soc.hv[i] = self.dinv[r] * soc.vb[i] - soc.eu[i] * (t / d1);
+                d2 -= soc.vb[i] * soc.hv[i];
+            }
+            soc.d2 = d2;
+            if !(d2 > T::from_f64(1e-13).unwrap()) {
+                return false;
+            }
+        }
+
         // numeric M_sp
         self.Msp.nzval.fill(T::zero());
         for (pi, &mi) in self.P_to_Msp.iter().enumerate() {
@@ -754,8 +788,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             ucol.fill(T::zero());
             vcol.fill(T::zero());
             for (i, r) in soc.rng.clone().enumerate() {
-                let gu = self.dinv[r] * soc.ub[i];
-                let gv = self.dinv[r] * soc.vb[i];
+                let gu = soc.eu[i];
+                let gv = soc.hv[i];
                 for j in self.At.colptr[r]..self.At.colptr[r + 1] {
                     let c = self.At.rowval[j];
                     let v = self.At.nzval[j];
@@ -790,26 +824,14 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         for uc in 0..self.thick_rows.len() {
             self.core[uc * self.k + uc] = T::one();
         }
-        // sparse-SOC pairs: C^{-1} = -(J + [ub vb]' D^{-1} [ub vb]), rescaled
-        // by the column normalizations applied below
+        // sparse-SOC rank-1 pair: two decoupled entries; contribution to M is
+        //   - g1 g1'/d1 + g2 g2'/d2  with columns normalized by su, sv
         for (si, soc) in self.socs.iter().enumerate() {
-            let mut s_uu = T::zero();
-            let mut s_uv = T::zero();
-            let mut s_vv = T::zero();
-            for (i, r) in soc.rng.clone().enumerate() {
-                let di = self.dinv[r];
-                s_uu += soc.ub[i] * di * soc.ub[i];
-                s_uv += soc.ub[i] * di * soc.vb[i];
-                s_vv += soc.vb[i] * di * soc.vb[i];
-            }
             let base = self.soc_col_offset + 2 * si;
             let su = self.soc_col_scale[2 * si];
             let sv = self.soc_col_scale[2 * si + 1];
-
-            self.core[base * self.k + base] = -(T::one() + s_uu) / (su * su);
-            self.core[(base + 1) * self.k + base] = -s_uv / (su * sv);
-            self.core[base * self.k + (base + 1)] = -s_uv / (su * sv);
-            self.core[(base + 1) * self.k + (base + 1)] = -(-T::one() + s_vv) / (sv * sv);
+            self.core[base * self.k + base] = -soc.d1 / (su * su);
+            self.core[(base + 1) * self.k + (base + 1)] = soc.d2 / (sv * sv);
         }
 
         for cj in 0..self.k {
@@ -957,29 +979,10 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                     pu += ucol[i] * x0[i];
                     pv += vcol[i] * x0[i];
                 }
-                // scaled C block = Sg^{-1} C Sg^{-1}, C = -core2^{-1}
-                // solve core2 y = [pu/su... careful: contribution = Ucols * Cblock * [pu; pv]
-                // with Cblock^{-1} = -(J+S) scaled by 1/(s_i s_j):
-                // Cblock = -inv(core2) scaled by s_i s_j... equivalently solve:
-                let mut s_uu = T::zero();
-                let mut s_uv = T::zero();
-                let mut s_vv = T::zero();
-                for (i, r) in soc.rng.clone().enumerate() {
-                    let di = self.dinv[r];
-                    s_uu += soc.ub[i] * di * soc.ub[i];
-                    s_uv += soc.ub[i] * di * soc.vb[i];
-                    s_vv += soc.vb[i] * di * soc.vb[i];
-                }
-                let a = T::one() + s_uu;
-                let d2 = -T::one() + s_vv;
-                let det = a * d2 - s_uv * s_uv;
-                // unscaled q = -core2^{-1} [su*pu; sv*pv]
-                let ru = su * pu;
-                let rv = sv * pv;
-                let qu = -(d2 * ru - s_uv * rv) / det;
-                let qv = -(-s_uv * ru + a * rv) / det;
+                let cu = -(su * su) / soc.d1;
+                let cv = (sv * sv) / soc.d2;
                 for i in 0..self.n {
-                    fwd[i] += ucol[i] * (su * qu) + vcol[i] * (sv * qv);
+                    fwd[i] += ucol[i] * (cu * pu) + vcol[i] * (cv * pv);
                 }
             }
             let mut ferr = T::zero();
