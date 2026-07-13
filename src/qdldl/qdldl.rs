@@ -333,6 +333,19 @@ struct QDLDLWorkspace<T> {
 
     // lazily allocated per-thread scratch for the parallel factorization
     par_scratch: Vec<ParScratch<T>>,
+
+    // static-structure replay cache for numeric refactorization: after the
+    // first numeric factorization the sparsity of L is fixed, so refactors
+    // can replay each row's elimination sequence directly. pat_ptr indexes
+    // rows 1..n into (pat_cols, pat_slots): the column eliminated against and
+    // the L slot the row's entry lands in, in the exact processing order of
+    // the discovery-based code. li32 is a u32 copy of L.rowval (halving the
+    // index traffic of the dominant inner loop).
+    pat_ptr: Vec<usize>,
+    pat_cols: Vec<u32>,
+    pat_slots: Vec<u32>,
+    li32: Vec<u32>,
+    pat_ready: bool,
 }
 
 // per-thread scratch mirroring the y_markers/y_idx/elim_buffer/y_vals split
@@ -443,6 +456,11 @@ where
             wf_order,
             wf_offsets,
             par_scratch: Vec::new(),
+            pat_ptr: Vec::new(),
+            pat_cols: Vec::new(),
+            pat_slots: Vec::new(),
+            li32: Vec::new(),
+            pat_ready: false,
         })
     }
 }
@@ -770,6 +788,37 @@ fn _factor_inner<T: FloatT>(
 // bitwise identical to the serial factorization: every entry is computed from
 // the same inputs with the same inner loop order, independent of scheduling.
 #[allow(non_snake_case)]
+// Wavefront-parallel variant of _factor_inner with a static-structure replay cache.
+//
+// Rows are processed in ascending elimination-tree height order; rows of equal
+// height are processed in parallel. Safety of the shared mutation relies on
+// standard elimination-tree structure properties:
+//
+//   * the sparsity pattern of row k of L (the columns its triangular solve
+//     reads, and the columns it appends one entry to) consists only of
+//     DESCENDANTS of k in the elimination tree;
+//   * every entry of column j of L is written by a row that is an ANCESTOR of
+//     j; ancestors of j form a chain with strictly increasing heights (and
+//     strictly increasing row indices), so within one wavefront at most one
+//     row touches any given column, appends across wavefronts occur in
+//     ascending row order (preserving CSC ordering), and every column read by
+//     a row was completed at strictly lower heights;
+//   * two rows of equal height have disjoint descendant sets (a common
+//     descendant would make one an ancestor of the other, contradicting equal
+//     heights).
+//
+// D[k]/Dinv[k] are written only by row k and read only for descendants
+// (strictly lower heights). Each worker uses its own y workspace. Results are
+// bitwise identical to the serial factorization: every entry is computed from
+// the same inputs with the same inner loop order, independent of scheduling.
+//
+// The sparsity structure of L is fixed after the first numeric factorization,
+// so that first call records, per row, the exact sequence of (column, L slot)
+// eliminations the discovery code performs (plus a u32 copy of L.rowval).
+// Subsequent refactorizations replay that sequence directly: no elimination
+// tree walks, no marker bookkeeping, no index writes, and 32-bit index reads
+// in the dominant inner loop.
+#[allow(non_snake_case)]
 fn _factor_inner_parallel<T: FloatT>(
     L: &mut CscMatrix<T>,
     D: &mut [T],
@@ -804,11 +853,6 @@ fn _factor_inner_parallel<T: FloatT>(
     }
 
     D.fill(T::zero());
-    // next available space in each column of L; stored in the same iwork
-    // segment the serial code uses, though only this function touches it here
-    let (_, iwork) = workspace.iwork.split_at_mut(n);
-    let (_, next_colspace) = iwork.split_at_mut(n);
-    next_colspace.copy_from_slice(&Lp[0..Lp.len() - 1]);
 
     let mut regularize_count_total = 0usize;
     let mut positive_total = 0usize;
@@ -829,93 +873,175 @@ fn _factor_inner_parallel<T: FloatT>(
     }
     Dinv[0] = T::recip(D[0]);
 
-    // shared outputs, mutated disjointly per the wavefront argument above
+    if !workspace.pat_ready {
+        // First numeric factorization: run the serial discovery-based
+        // elimination, recording each row's processing sequence.
+        assert!(L.nzval.len() <= u32::MAX as usize && n <= u32::MAX as usize);
+
+        let (y_idx, iwork) = workspace.iwork.split_at_mut(n);
+        let (elim_buffer, next_colspace) = iwork.split_at_mut(n);
+        let y_markers = &mut workspace.bwork;
+        let y_vals = &mut workspace.fwork;
+        next_colspace.copy_from_slice(&Lp[0..Lp.len() - 1]);
+
+        let pat_ptr = &mut workspace.pat_ptr;
+        let pat_cols = &mut workspace.pat_cols;
+        let pat_slots = &mut workspace.pat_slots;
+        pat_ptr.clear();
+        pat_cols.clear();
+        pat_slots.clear();
+        pat_ptr.reserve(n + 1);
+        pat_ptr.push(0);
+        pat_ptr.push(0); // row 0 is empty
+        pat_cols.reserve(L.nzval.len());
+        pat_slots.reserve(L.nzval.len());
+
+        let (Li, Lx) = (&mut L.rowval, &mut L.nzval);
+
+        for k in 1..n {
+            // pattern discovery, identical to _factor_inner
+            let mut nnz_y = 0usize;
+            let mut dk = T::zero();
+
+            for i in Ap[k]..Ap[k + 1] {
+                let bidx = Ai[i];
+                if bidx == k {
+                    dk = Ax[i];
+                    continue;
+                }
+                y_vals[bidx] = Ax[i];
+
+                let next_idx = bidx;
+                if y_markers[next_idx] == QDLDL_UNUSED {
+                    y_markers[next_idx] = QDLDL_USED;
+                    elim_buffer[0] = next_idx;
+                    let mut nnz_e = 1;
+                    let mut next_idx = etree[bidx];
+                    while next_idx != QDLDL_UNKNOWN && next_idx < k {
+                        if y_markers[next_idx] == QDLDL_USED {
+                            break;
+                        }
+                        y_markers[next_idx] = QDLDL_USED;
+                        elim_buffer[nnz_e] = next_idx;
+                        next_idx = etree[next_idx];
+                        nnz_e += 1;
+                    }
+                    while nnz_e != 0 {
+                        nnz_e -= 1;
+                        y_idx[nnz_y] = elim_buffer[nnz_e];
+                        nnz_y += 1;
+                    }
+                }
+            }
+
+            for i in (0..nnz_y).rev() {
+                let cidx = y_idx[i];
+                let tmp_idx = next_colspace[cidx];
+                pat_cols.push(cidx as u32);
+                pat_slots.push(tmp_idx as u32);
+
+                let y_vals_cidx = y_vals[cidx];
+                let (f, l) = (Lp[cidx], tmp_idx);
+                unsafe {
+                    for (&Lxj, &Lij) in zip(&Lx[f..l], &Li[f..l]) {
+                        *(y_vals.get_unchecked_mut(Lij)) -= Lxj * y_vals_cidx;
+                    }
+                    let lx_tmp = y_vals_cidx * *Dinv.get_unchecked(cidx);
+                    *Lx.get_unchecked_mut(tmp_idx) = lx_tmp;
+                    dk -= y_vals_cidx * lx_tmp;
+                }
+
+                Li[tmp_idx] = k;
+                next_colspace[cidx] += 1;
+                y_vals[cidx] = T::zero();
+                y_markers[cidx] = QDLDL_UNUSED;
+            }
+            pat_ptr.push(pat_cols.len());
+
+            if regularize_enable {
+                let sign = T::from_i8(Dsigns[k]).unwrap();
+                if dk * sign < regularize_eps {
+                    dk = regularize_delta * sign;
+                    regularize_count_total += 1;
+                }
+            }
+            if dk.is_zero() {
+                return Err(QDLDLError::ZeroPivot);
+            }
+            if dk > T::zero() {
+                positive_total += 1;
+            }
+            D[k] = dk;
+            Dinv[k] = T::recip(dk);
+        }
+
+        workspace.li32 = Li.iter().map(|&i| i as u32).collect();
+        workspace.pat_ready = true;
+        workspace.regularize_count = regularize_count_total;
+        return Ok(positive_total);
+    }
+
+    // Replay path: the structure of L (rowval, colptr, per-row elimination
+    // sequences) is unchanged; only values are recomputed.
+    let pat_ptr = &workspace.pat_ptr;
+    let pat_cols = &workspace.pat_cols;
+    let pat_slots = &workspace.pat_slots;
+    let li32 = &workspace.li32;
+
     let Lp_ptr = SendPtr(Lp.as_ptr());
-    let Li_ptr = SendPtr(L.rowval.as_mut_ptr());
     let Lx_ptr = SendPtr(L.nzval.as_mut_ptr());
     let D_ptr = SendPtr(D.as_mut_ptr());
     let Dinv_ptr = SendPtr(Dinv.as_mut_ptr());
-    let colspace_ptr = SendPtr(next_colspace.as_mut_ptr());
 
     let zero_pivot = AtomicBool::new(false);
     let positive_count = AtomicUsize::new(0);
     let regularize_count_atomic = AtomicUsize::new(0);
 
-    // the per-row kernel; caller guarantees rows within a call batch are of
-    // equal elimination-tree height and scratch is exclusive to this call
     let factor_row = |k: usize, scratch: &mut ParScratch<T>| -> bool {
-        let y_markers = &mut scratch.y_markers;
-        let y_idx = &mut scratch.y_idx;
-        let elim_buffer = &mut scratch.elim_buffer;
         let y_vals = &mut scratch.y_vals;
+        let (Lp, Lx, D, Dinv) = (Lp_ptr, Lx_ptr, D_ptr, Dinv_ptr);
 
-        let (Lp, Li, Lx) = (Lp_ptr, Li_ptr, Lx_ptr);
-        let (D, Dinv, next_colspace) = (D_ptr, Dinv_ptr, colspace_ptr);
-
-        let mut nnz_y = 0usize;
         let mut dk = T::zero();
-
         for i in Ap[k]..Ap[k + 1] {
             let bidx = Ai[i];
             if bidx == k {
                 dk = Ax[i];
-                continue;
-            }
-
-            y_vals[bidx] = Ax[i];
-
-            let next_idx = bidx;
-            if y_markers[next_idx] == QDLDL_UNUSED {
-                y_markers[next_idx] = QDLDL_USED;
-                elim_buffer[0] = next_idx;
-                let mut nnz_e = 1;
-
-                let mut next_idx = etree[bidx];
-                while next_idx != QDLDL_UNKNOWN && next_idx < k {
-                    if y_markers[next_idx] == QDLDL_USED {
-                        break;
-                    }
-                    y_markers[next_idx] = QDLDL_USED;
-                    elim_buffer[nnz_e] = next_idx;
-                    next_idx = etree[next_idx];
-                    nnz_e += 1;
-                }
-
-                while nnz_e != 0 {
-                    nnz_e -= 1;
-                    y_idx[nnz_y] = elim_buffer[nnz_e];
-                    nnz_y += 1;
-                }
+            } else {
+                y_vals[bidx] = Ax[i];
             }
         }
 
-        for i in (0..nnz_y).rev() {
-            let cidx = y_idx[i];
+        unsafe {
+            // Safety: every column in this row's cached pattern is a
+            // descendant of k, so no other row in this wavefront reads or
+            // writes its L values or D entries; all values read were
+            // completed at strictly lower wavefronts. The slot for this
+            // row's entry in each column is fixed by the static structure.
+            for idx in *pat_ptr.get_unchecked(k)..*pat_ptr.get_unchecked(k + 1) {
+                let cidx = *pat_cols.get_unchecked(idx) as usize;
+                let slot = *pat_slots.get_unchecked(idx) as usize;
 
-            unsafe {
-                // Safety: cidx is a descendant of k, so no other row in this
-                // wavefront reads or writes column cidx, its L entries, D, or
-                // its next_colspace slot; all entries read were completed at
-                // strictly lower wavefronts.
-                let tmp_idx = *next_colspace.0.add(cidx);
-                let y_vals_cidx = y_vals[cidx];
-
-                let (f, l) = (*Lp_ptr.0.add(cidx), tmp_idx);
-                for idx in f..l {
-                    let lij = *Li.0.add(idx);
-                    *(y_vals.get_unchecked_mut(lij)) -= *Lx.0.add(idx) * y_vals_cidx;
+                let y_vals_cidx = *y_vals.get_unchecked(cidx);
+                let f = *Lp.0.add(cidx);
+                const PF_DIST: usize = 24;
+                for j in f..slot {
+                    #[cfg(target_arch = "x86_64")]
+                    if j + PF_DIST < slot {
+                        let pf = *li32.get_unchecked(j + PF_DIST) as usize;
+                        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+                            y_vals.as_ptr().add(pf) as *const i8,
+                        );
+                    }
+                    let lij = *li32.get_unchecked(j) as usize;
+                    *(y_vals.get_unchecked_mut(lij)) -= *Lx.0.add(j) * y_vals_cidx;
                 }
 
                 let lx_tmp = y_vals_cidx * *Dinv.0.add(cidx);
-                *Lx.0.add(tmp_idx) = lx_tmp;
+                *Lx.0.add(slot) = lx_tmp;
                 dk -= y_vals_cidx * lx_tmp;
 
-                *Li.0.add(tmp_idx) = k;
-                *next_colspace.0.add(cidx) = tmp_idx + 1;
+                *y_vals.get_unchecked_mut(cidx) = T::zero();
             }
-
-            y_vals[cidx] = T::zero();
-            y_markers[cidx] = QDLDL_UNUSED;
         }
 
         if regularize_enable {
@@ -938,7 +1064,6 @@ fn _factor_inner_parallel<T: FloatT>(
             *D.0.add(k) = dk;
             *Dinv.0.add(k) = T::recip(dk);
         }
-        let _ = Lp;
         true
     };
 

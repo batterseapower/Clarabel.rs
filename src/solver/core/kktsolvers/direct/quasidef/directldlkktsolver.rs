@@ -197,6 +197,14 @@ where
             self.getlhs(lhsx, lhsz);
         }
 
+        if let Ok(dir) = std::env::var("CLARABEL_DUMP_KKT") {
+            if self.kktfull_stale {
+                _refresh_full_values(&mut self.KKTfull, &self.fullmap, &self.KKT);
+                self.kktfull_stale = false;
+            }
+            _dump_kkt_call(&dir, &self.KKTfull, &self.b, &self.x, self.n, self.m, self.p);
+        }
+
         is_success
     }
 
@@ -419,6 +427,55 @@ fn _build_full_from_triangle<T: FloatT>(
 
     let full = CscMatrix::new(n, n, colptr, rowval, vec![T::zero(); nnz]);
     (full, fullmap)
+}
+
+// Debug instrumentation: dump the full KKT (structure once) plus per-call
+// values/rhs/solution as raw little-endian binary for offline analysis.
+fn _dump_kkt_call<T: FloatT>(
+    dir: &str,
+    KKTfull: &CscMatrix<T>,
+    b: &[T],
+    x: &[T],
+    n: usize,
+    m: usize,
+    p: usize,
+) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALL: AtomicUsize = AtomicUsize::new(0);
+    let call = CALL.fetch_add(1, Ordering::Relaxed);
+    if call >= 400 {
+        return;
+    }
+
+    let write_u64 = |path: String, vals: &[usize]| {
+        let mut f = std::fs::File::create(path).unwrap();
+        for &v in vals {
+            f.write_all(&(v as u64).to_le_bytes()).unwrap();
+        }
+    };
+    let write_f64 = |path: String, vals: &[T]| {
+        let mut f = std::fs::File::create(path).unwrap();
+        for &v in vals {
+            f.write_all(&v.to_f64().unwrap().to_le_bytes()).unwrap();
+        }
+    };
+
+    if call == 0 {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            format!("{dir}/meta.txt"),
+            format!("n={} m={} p={} dim={} nnz={}
+", n, m, p, KKTfull.n, KKTfull.nzval.len()),
+        )
+        .unwrap();
+        write_u64(format!("{dir}/indptr.u64"), &KKTfull.colptr);
+        write_u64(format!("{dir}/indices.u64"), &KKTfull.rowval);
+    }
+    write_f64(format!("{dir}/data_{call:04}.f64"), &KKTfull.nzval);
+    write_f64(format!("{dir}/b_{call:04}.f64"), b);
+    write_f64(format!("{dir}/x_{call:04}.f64"), x);
 }
 
 fn _refresh_full_values<T: FloatT>(KKTfull: &mut CscMatrix<T>, fullmap: &[usize], KKT: &CscMatrix<T>) {
