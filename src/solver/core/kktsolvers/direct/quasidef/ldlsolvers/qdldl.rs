@@ -45,6 +45,15 @@ where
 
         let factors = QDLDLFactorisation::<T>::new(KKT, Some(opts)).unwrap();
 
+        if std::env::var("CLARABEL_DEBUG_KKT").is_ok() {
+            eprintln!(
+                "CLARABEL_DEBUG_KKT: n={} nnz(triu KKT)={} nnz(L)={}",
+                KKT.ncols(),
+                factors.nnzA(),
+                factors.nnzL()
+            );
+        }
+
         Self { factors }
     }
 }
