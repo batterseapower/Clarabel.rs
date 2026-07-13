@@ -824,7 +824,56 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             }
         }
 
+        let core_dbg = if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
+            Some(self.core.clone())
+        } else {
+            None
+        };
         let ok = dense_lu_factor(&mut self.core, self.k, &mut self.core_piv);
+
+        if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
+            // LDL accuracy: e = Msp (ldl^{-1} y) - y
+            let y0: Vec<T> = (0..self.n)
+                .map(|i| T::from_f64(((i * 48271) % 89) as f64 / 44.5 - 1.0).unwrap())
+                .collect();
+            let mut x = y0.clone();
+            self.ldl.solve(&mut x);
+            let mut e = vec![T::zero(); self.n];
+            for col in 0..self.n {
+                let xc = x[col];
+                for i in self.Msp.colptr[col]..self.Msp.colptr[col + 1] {
+                    let row = self.Msp.rowval[i];
+                    let v = self.Msp.nzval[i];
+                    e[row] += v * xc;
+                    if row != col {
+                        e[col] += v * x[row];
+                    }
+                }
+            }
+            let mut lerr = T::zero();
+            for i in 0..self.n {
+                lerr = T::max(lerr, (e[i] - y0[i]).abs());
+            }
+            eprintln!("ldl(Msp) accuracy: err={:?} regularize_count={}", lerr.to_f64(), self.ldl.regularize_count());
+
+            let mut mn = T::infinity();
+            let mut mx = T::zero();
+            for c in 0..self.k {
+                let v = self.core[c * self.k + c].abs();
+                mn = T::min(mn, v);
+                mx = T::max(mx, v);
+            }
+            let mut hmin = T::infinity();
+            let mut hmax = T::zero();
+            for r in 0..self.m {
+                hmin = T::min(hmin, self.hdiag[r].abs());
+                hmax = T::max(hmax, self.hdiag[r].abs());
+            }
+            eprintln!(
+                "core pivots: ok={} min={:?} max={:?} | hdiag range [{:?}, {:?}]",
+                ok, mn.to_f64(), mx.to_f64(), hmin.to_f64(), hmax.to_f64()
+            );
+        }
 
         if ok && std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
             // roundtrip: x0 -> r = M x0 (via exact H^{-1} action) -> M^{-1} r
@@ -863,10 +912,122 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 }
             }
             let mut err = T::zero();
+            let mut amax = 0usize;
             for i in 0..self.n {
-                err = T::max(err, (x[i] - x0[i]).abs());
+                let e = (x[i] - x0[i]).abs();
+                if e > err {
+                    err = e;
+                    amax = i;
+                }
             }
-            eprintln!("M woodbury roundtrip: err={:?}", err.to_f64());
+
+            // forward check: (Msp + U C U') x0 vs r (assembly vs solve isolation)
+            let mut fwd = vec![T::zero(); self.n];
+            for col in 0..self.n {
+                let xc = x0[col];
+                for i in self.Msp.colptr[col]..self.Msp.colptr[col + 1] {
+                    let row = self.Msp.rowval[i];
+                    let v = self.Msp.nzval[i];
+                    fwd[row] += v * xc;
+                    if row != col {
+                        fwd[col] += v * x0[row];
+                    }
+                }
+            }
+            // U C U' x0: thick block C = I; soc pairs C = -core2^{-1} (scaled)
+            for uc in 0..self.thick_rows.len() {
+                let col = &self.U[uc * self.n..(uc + 1) * self.n];
+                let mut acc = T::zero();
+                for (ci, xi) in zip(col, x0.iter()) {
+                    acc += *ci * *xi;
+                }
+                for i in 0..self.n {
+                    fwd[i] += col[i] * acc;
+                }
+            }
+            for (si, soc) in self.socs.iter().enumerate() {
+                let base = self.soc_col_offset + 2 * si;
+                let su = self.soc_col_scale[2 * si];
+                let sv = self.soc_col_scale[2 * si + 1];
+                let ucol = &self.U[base * self.n..(base + 1) * self.n];
+                let vcol = &self.U[(base + 1) * self.n..(base + 2) * self.n];
+                let mut pu = T::zero();
+                let mut pv = T::zero();
+                for i in 0..self.n {
+                    pu += ucol[i] * x0[i];
+                    pv += vcol[i] * x0[i];
+                }
+                // scaled C block = Sg^{-1} C Sg^{-1}, C = -core2^{-1}
+                // solve core2 y = [pu/su... careful: contribution = Ucols * Cblock * [pu; pv]
+                // with Cblock^{-1} = -(J+S) scaled by 1/(s_i s_j):
+                // Cblock = -inv(core2) scaled by s_i s_j... equivalently solve:
+                let mut s_uu = T::zero();
+                let mut s_uv = T::zero();
+                let mut s_vv = T::zero();
+                for (i, r) in soc.rng.clone().enumerate() {
+                    let di = self.dinv[r];
+                    s_uu += soc.ub[i] * di * soc.ub[i];
+                    s_uv += soc.ub[i] * di * soc.vb[i];
+                    s_vv += soc.vb[i] * di * soc.vb[i];
+                }
+                let a = T::one() + s_uu;
+                let d2 = -T::one() + s_vv;
+                let det = a * d2 - s_uv * s_uv;
+                // unscaled q = -core2^{-1} [su*pu; sv*pv]
+                let ru = su * pu;
+                let rv = sv * pv;
+                let qu = -(d2 * ru - s_uv * rv) / det;
+                let qv = -(-s_uv * ru + a * rv) / det;
+                for i in 0..self.n {
+                    fwd[i] += ucol[i] * (su * qu) + vcol[i] * (sv * qv);
+                }
+            }
+            let mut ferr = T::zero();
+            for i in 0..self.n {
+                ferr = T::max(ferr, (fwd[i] - r[i]).abs());
+            }
+
+            // LU consistency: core_dbg * wk_solved vs rhs (U' ldl^{-1} r)
+            let mut xs = r.clone();
+            self.ldl.solve(&mut xs);
+            let mut rhs_k = vec![T::zero(); self.k];
+            for c in 0..self.k {
+                let col = &self.U[c * self.n..(c + 1) * self.n];
+                let mut acc = T::zero();
+                for (ci, xi) in zip(col, xs.iter()) {
+                    acc += *ci * *xi;
+                }
+                rhs_k[c] = acc;
+            }
+            let mut wk2 = rhs_k.clone();
+            dense_lu_solve(&self.core, &self.core_piv, self.k, &mut wk2);
+            let cd = core_dbg.as_ref().unwrap();
+            let mut luerr = T::zero();
+            let mut wkmax = T::zero();
+            for i in 0..self.k {
+                let mut acc = T::zero();
+                for c in 0..self.k {
+                    acc += cd[c * self.k + i] * wk2[c];
+                }
+                luerr = T::max(luerr, (acc - rhs_k[i]).abs());
+                wkmax = T::max(wkmax, wk2[i].abs());
+            }
+            eprintln!(
+                "M woodbury roundtrip: err={:?} argmax={} | forward assembly err={:?} | core LU err={:?} |wk|={:?}",
+                err.to_f64(), amax, ferr.to_f64(), luerr.to_f64(), wkmax.to_f64()
+            );
+            for (si, soc) in self.socs.iter().enumerate() {
+                let base = self.soc_col_offset + 2 * si;
+                eprintln!(
+                    "  soc{}: su={:?} sv={:?} Cinv=[{:?} {:?}; . {:?}]",
+                    si,
+                    self.soc_col_scale[2 * si].to_f64(),
+                    self.soc_col_scale[2 * si + 1].to_f64(),
+                    cd[base * self.k + base].to_f64(),
+                    cd[(base + 1) * self.k + base].to_f64(),
+                    cd[(base + 1) * self.k + (base + 1)].to_f64(),
+                );
+            }
         }
         ok
     }
