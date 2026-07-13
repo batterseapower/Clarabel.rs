@@ -74,6 +74,10 @@ struct DenseSocScaling<T> {
 pub struct CondensedKKTSolver<T> {
     m: usize,
     n: usize,
+    // augmented factor dimension n + n_eq (equality rows live in the factor)
+    nn: usize,
+    eq_rows: Vec<usize>,
+    eq_entries: Vec<(usize, T)>,
 
     // problem data (P upper triangular)
     P: CscMatrix<T>,
@@ -116,6 +120,8 @@ pub struct CondensedKKTSolver<T> {
 
     // work
     work_n: Vec<T>,
+    work_nn: Vec<T>,
+    work_nn2: Vec<T>,
     work_m: Vec<T>,
     work_k: Vec<T>,
 
@@ -159,9 +165,15 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         // structure check + collect SOC layouts
         let mut soc_rngs = Vec::new();
         let mut dense_soc_rngs = Vec::new();
+        let mut eq_rows: Vec<usize> = Vec::new();
         for (cone, rng) in zip(cones.iter(), cones.rng_cones.iter()) {
             match cone {
                 SupportedCone::NonnegativeCone(_) => {}
+                SupportedCone::ZeroCone(_) => {
+                    // equality rows have no scaling block (H = 0); they stay
+                    // in the factored system as a quasidefinite augmentation
+                    eq_rows.extend(rng.clone());
+                }
                 SupportedCone::SecondOrderCone(soc) => {
                     if soc.sparse_data.is_some() {
                         soc_rngs.push(rng.clone());
@@ -169,7 +181,12 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                         dense_soc_rngs.push(rng.clone());
                     }
                 }
-                _ => return None,
+                _ => {
+                    if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
+                        eprintln!("condensed: rejected, unsupported cone type");
+                    }
+                    return None;
+                }
             }
         }
 
@@ -200,25 +217,57 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 is_thick[r] = false;
             }
         }
-        let thick_rows: Vec<usize> = (0..m).filter(|&r| is_thick[r] && !is_dense_soc_row[r]).collect();
+        let mut is_eq = vec![false; m];
+        for &r in &eq_rows {
+            is_eq[r] = true;
+        }
+        let thick_rows: Vec<usize> =
+            (0..m).filter(|&r| is_thick[r] && !is_dense_soc_row[r] && !is_eq[r]).collect();
         let thin_rows: Vec<usize> =
-            (0..m).filter(|&r| !is_thick[r] && !is_dense_soc_row[r]).collect();
+            (0..m).filter(|&r| !is_thick[r] && !is_dense_soc_row[r] && !is_eq[r]).collect();
+
+        // profitability gate: condensing pays when the factored dimension
+        // collapses relative to the full KKT (n + n_eq << n + m). Measured on
+        // CBLIB: problems near the boundary (chainsing-10000, ratio ~0.4)
+        // regress ~25%, our rebalance problems (ratio ~0.31) win heavily.
+        let nn_pred = n + eq_rows.len();
+        if (nn_pred as f64) > 0.35 * ((n + m) as f64) {
+            if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
+                eprintln!(
+                    "condensed: rejected, dimension ratio {:.2} > 0.35",
+                    nn_pred as f64 / (n + m) as f64
+                );
+            }
+            return None;
+        }
 
         let n_thick = thick_rows.len();
         let k = n_thick + soc_rngs.len();
         if k > ((n as f64) * MAX_RANK_FRACTION) as usize + 16 {
+            if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
+                eprintln!("condensed: rejected, k={} (thick {} + soc {}) vs cap {}",
+                    k, n_thick, soc_rngs.len(), ((n as f64) * MAX_RANK_FRACTION) as usize + 16);
+            }
             return None;
         }
 
-        // ---- symbolic M_sp: triu(P) ∪ diagonal ∪ thin-row pair products
+        // ---- symbolic M_sp over the augmented dimension N = n + n_eq:
+        // triu(P) ∪ diagonal ∪ thin-row pair products ∪ equality coupling
+        let n_eq = eq_rows.len();
+        let nn = n + n_eq;
         let mut pairs: Vec<(usize, usize)> = Vec::new(); // (col, row), row <= col
         for col in 0..n {
             for i in P.colptr[col]..P.colptr[col + 1] {
                 pairs.push((col, P.rowval[i]));
             }
         }
-        for i in 0..n {
+        for i in 0..nn {
             pairs.push((i, i));
+        }
+        for (ei, &r) in eq_rows.iter().enumerate() {
+            for j in At.colptr[r]..At.colptr[r + 1] {
+                pairs.push((n + ei, At.rowval[j]));
+            }
         }
         for &r in &thin_rows {
             let cols = &At.rowval[At.colptr[r]..At.colptr[r + 1]];
@@ -246,15 +295,15 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         pairs.dedup();
 
         let nnz_m = pairs.len();
-        let mut colptr = vec![0usize; n + 1];
+        let mut colptr = vec![0usize; nn + 1];
         for &(c, _) in &pairs {
             colptr[c + 1] += 1;
         }
-        for i in 0..n {
+        for i in 0..nn {
             colptr[i + 1] += colptr[i];
         }
         let rowval: Vec<usize> = pairs.iter().map(|&(_, r)| r).collect();
-        let Msp = CscMatrix::new(n, n, colptr, rowval, vec![T::zero(); nnz_m]);
+        let Msp = CscMatrix::new(nn, nn, colptr, rowval, vec![T::zero(); nnz_m]);
 
         let find_nz = |col: usize, row: usize| -> usize {
             let f = Msp.colptr[col];
@@ -268,7 +317,14 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 P_to_Msp.push(find_nz(col, P.rowval[i]));
             }
         }
-        let Msp_diag_idx: Vec<usize> = (0..n).map(|i| find_nz(i, i)).collect();
+        let Msp_diag_idx: Vec<usize> = (0..nn).map(|i| find_nz(i, i)).collect();
+        // static A_eq entries in the augmented block: (msp index, value)
+        let mut eq_entries: Vec<(usize, T)> = Vec::new();
+        for (ei, &r) in eq_rows.iter().enumerate() {
+            for j in At.colptr[r]..At.colptr[r + 1] {
+                eq_entries.push((find_nz(n + ei, At.rowval[j]), At.nzval[j]));
+            }
+        }
 
         // contribution matrix (CSC by thin row): values A_r[i]*A_r[j] at Msp slots
         let mut contrib_colptr = vec![0usize; thin_rows.len() + 1];
@@ -289,9 +345,13 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             contrib_colptr[tr + 1] = contrib_rowval.len();
         }
 
+        let mut dsigns = vec![1i8; nn];
+        for d in dsigns[n..].iter_mut() {
+            *d = -1;
+        }
         let opts = QDLDLSettingsBuilder::default()
             .logical(true)
-            .Dsigns(vec![1i8; n])
+            .Dsigns(dsigns)
             .regularize_enable(true)
             .regularize_eps(settings.dynamic_regularization_eps)
             .regularize_delta(settings.dynamic_regularization_delta)
@@ -299,10 +359,10 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             .unwrap();
         let ldl = QDLDLFactorisation::<T>::new(&Msp, Some(opts)).ok()?;
 
-        // static U columns for thick rows
-        let mut U = vec![T::zero(); n * k];
+        // static U columns for thick rows (padded with zeros on the eq block)
+        let mut U = vec![T::zero(); nn * k];
         for (uc, &r) in thick_rows.iter().enumerate() {
-            let col = &mut U[uc * n..(uc + 1) * n];
+            let col = &mut U[uc * nn..(uc + 1) * nn];
             for i in At.colptr[r]..At.colptr[r + 1] {
                 col[At.rowval[i]] = At.nzval[i];
             }
@@ -363,6 +423,9 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         Some(Self {
             m,
             n,
+            nn,
+            eq_rows,
+            eq_entries,
             P,
             A,
             At,
@@ -385,12 +448,14 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             soc_col_scale: vec![T::one(); socs_len],
             thick_col_scale: vec![T::one(); n_thick],
             U,
-            Y: vec![T::zero(); n * k],
+            Y: vec![T::zero(); nn * k],
             core: vec![T::zero(); k * k],
             core_piv: vec![0usize; k],
             bx: vec![T::zero(); n],
             bz: vec![T::zero(); m],
             work_n: vec![T::zero(); n],
+            work_nn: vec![T::zero(); nn],
+            work_nn2: vec![T::zero(); nn],
             work_m: vec![T::zero(); m],
             work_k: vec![T::zero(); k],
             static_reg: settings.static_regularization_constant,
@@ -406,6 +471,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 SupportedCone::NonnegativeCone(_) => {
                     cone.get_Hs(&mut self.hdiag[rng.clone()]);
                 }
+                SupportedCone::ZeroCone(_) => {}
                 SupportedCone::SecondOrderCone(c) => {
                     if c.sparse_data.is_some() {
                         let soc = &mut self.socs[soc_i];
@@ -447,6 +513,14 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         }
         for r in 0..self.m {
             self.dinv[r] = T::recip(self.hdiag[r]);
+        }
+        // equality rows: no scaling block. hdiag = 0 makes H_mul exact (their
+        // residual has no H term); dinv = 0 removes them from A' H^{-1} terms
+        // (they are handled through the augmented factor instead).
+        for i in 0..self.eq_rows.len() {
+            let r = self.eq_rows[i];
+            self.hdiag[r] = T::zero();
+            self.dinv[r] = T::zero();
         }
 
         // w-form Sherman-Morrison cache per sparse SOC. |delta| must be
@@ -638,32 +712,40 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         e
     }
 
-    // one condensed solve pass: (bx, bz) -> (x, z)
+    // one condensed solve pass: (bx, bz) -> (x, z) through the augmented factor
     fn solve_once(&mut self, bx: &[T], bz: &[T], x: &mut [T], z: &mut [T]) {
-        // rhs = bx + A' H^{-1} bz  (reuse z as H^{-1} bz scratch)
+        // rhs = [bx + A' H^{-1} bz ; b_eq]  (reuse z as H^{-1} bz scratch;
+        // dinv is zero on equality rows so they contribute nothing here)
         self.H_solve(z, bz);
-        let mut rn = std::mem::take(&mut self.work_n);
-        self.At_mul(&mut rn, z);
+        let mut rn = std::mem::take(&mut self.work_nn);
+        {
+            let (head, _) = rn.split_at_mut(self.n);
+            self.At_mul(head, z);
+        }
         for i in 0..self.n {
             rn[i] += bx[i];
         }
+        for (ei, &r) in self.eq_rows.iter().enumerate() {
+            rn[self.n + ei] = bz[r];
+        }
 
-        // x = M^{-1} rhs via Woodbury
-        x.copy_from_slice(&rn);
-        self.work_n = rn;
-        self.ldl.solve(x);
+        // xa = M_aug^{-1} rhs via Woodbury
+        let mut xa = std::mem::take(&mut self.work_nn2);
+        xa.copy_from_slice(&rn);
+        self.work_nn = rn;
+        self.ldl.solve(&mut xa);
         let mut wk = std::mem::take(&mut self.work_k);
         for c in 0..self.k {
-            let col = &self.U[c * self.n..(c + 1) * self.n];
+            let col = &self.U[c * self.nn..(c + 1) * self.nn];
             let mut acc = T::zero();
             if c < self.soc_col_offset {
                 let r = self.thick_rows[c];
                 for j in self.At.colptr[r]..self.At.colptr[r + 1] {
                     let idx = self.At.rowval[j];
-                    acc += col[idx] * x[idx];
+                    acc += col[idx] * xa[idx];
                 }
             } else {
-                for (ci, xi) in zip(col, x.iter()) {
+                for (ci, xi) in zip(col, xa.iter()) {
                     acc += *ci * *xi;
                 }
             }
@@ -671,22 +753,29 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         }
         dense_lu_solve(&self.core, &self.core_piv, self.k, &mut wk);
         for c in 0..self.k {
-            let ycol = &self.Y[c * self.n..(c + 1) * self.n];
+            let ycol = &self.Y[c * self.nn..(c + 1) * self.nn];
             let w = wk[c];
-            for i in 0..self.n {
-                x[i] -= ycol[i] * w;
+            for i in 0..self.nn {
+                xa[i] -= ycol[i] * w;
             }
         }
         self.work_k = wk;
 
-        // z = H^{-1} (A x - bz)
+        x.copy_from_slice(&xa[..self.n]);
+
+        // z: inequality/SOC rows via H^{-1}(A x - bz); equality rows carry
+        // their multipliers from the augmented solve
         let mut tm = std::mem::take(&mut self.work_m);
         self.A_mul(&mut tm, x);
         for r in 0..self.m {
             tm[r] -= bz[r];
         }
         self.H_solve(z, &tm);
+        for (ei, &r) in self.eq_rows.iter().enumerate() {
+            z[r] = xa[self.n + ei];
+        }
         self.work_m = tm;
+        self.work_nn2 = xa;
     }
 }
 
@@ -741,9 +830,12 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             }
         }
 
+        for (mi, v) in &self.eq_entries {
+            self.Msp.nzval[*mi] = *v;
+        }
         let reg = self.static_reg;
-        for &di in &self.Msp_diag_idx {
-            self.Msp.nzval[di] += reg;
+        for (i, &di) in self.Msp_diag_idx.iter().enumerate() {
+            self.Msp.nzval[di] += if i < self.n { reg } else { -reg };
         }
 
         self.ldl.update_values(&self.Msp_all_idx, &self.Msp.nzval);
@@ -758,7 +850,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         // identity: keeps the Woodbury core well conditioned across the many
         // orders of magnitude the cone scalings span
         for (uc, &r) in self.thick_rows.iter().enumerate() {
-            let col = &mut self.U[uc * self.n..(uc + 1) * self.n];
+            let col = &mut self.U[uc * self.nn..(uc + 1) * self.nn];
             col.fill(T::zero());
             let sc = self.dinv[r].abs().sqrt();
             let mut mx = T::zero();
@@ -779,8 +871,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
 
         // sparse-SOC U column (one per SOC): g = A' (Ehat^{-1} w), normalized
         for (si, soc) in self.socs.iter().enumerate() {
-            let base = (self.soc_col_offset + si) * self.n;
-            let col = &mut self.U[base..base + self.n];
+            let base = (self.soc_col_offset + si) * self.nn;
+            let col = &mut self.U[base..base + self.nn];
             col.fill(T::zero());
             for (i, r) in soc.rng.clone().enumerate() {
                 let g = soc.euw[i];
@@ -824,10 +916,10 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         // core += U'Y. Thick U columns are sparse (scaled constraint rows), so
         // dot them through their nonzero patterns; only the per-SOC columns
         // are dense. Parallel over the k right-hand columns.
-        {
+        if self.k > 0 {
             use rayon::prelude::*;
             let kk = self.k;
-            let n = self.n;
+            let n = self.nn;
             let U = &self.U;
             let Y = &self.Y;
             let At = &self.At;
@@ -870,7 +962,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         } else {
             None
         };
-        let ok = dense_lu_factor(&mut self.core, self.k, &mut self.core_piv);
+        let ok = self.k == 0 || dense_lu_factor(&mut self.core, self.k, &mut self.core_piv);
 
         if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
             // LDL accuracy: e = Msp (ldl^{-1} y) - y
@@ -916,7 +1008,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             );
         }
 
-        if ok && std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
+        if ok && self.eq_rows.is_empty() && std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
             // roundtrip: x0 -> r = M x0 (via exact H^{-1} action) -> M^{-1} r
             let x0: Vec<T> = (0..self.n)
                 .map(|i| T::from_f64(((i * 2654435761) % 97) as f64 / 48.5 - 1.0).unwrap())
