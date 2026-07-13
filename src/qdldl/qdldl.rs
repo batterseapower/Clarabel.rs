@@ -325,7 +325,43 @@ struct QDLDLWorkspace<T> {
 
     // number of regularized entries in D
     regularize_count: usize,
+
+    // wavefront schedule for the parallel numeric factorization: nodes 1..n
+    // in ascending elimination-tree height order, with per-height offsets
+    wf_order: Vec<usize>,
+    wf_offsets: Vec<usize>,
+
+    // lazily allocated per-thread scratch for the parallel factorization
+    par_scratch: Vec<ParScratch<T>>,
 }
+
+// per-thread scratch mirroring the y_markers/y_idx/elim_buffer/y_vals split
+// of the serial factorization workspace
+#[derive(Debug)]
+struct ParScratch<T> {
+    y_markers: Vec<bool>,
+    y_idx: Vec<usize>,
+    elim_buffer: Vec<usize>,
+    y_vals: Vec<T>,
+}
+
+impl<T: FloatT> ParScratch<T> {
+    fn new(n: usize) -> Self {
+        Self {
+            y_markers: vec![QDLDL_UNUSED; n],
+            y_idx: vec![0; n],
+            elim_buffer: vec![0; n],
+            y_vals: vec![T::zero(); n],
+        }
+    }
+}
+
+// raw-pointer wrapper for the shared factorization outputs; safety of the
+// shared mutation is argued at the use site in _factor_inner_parallel
+#[derive(Clone, Copy)]
+struct SendPtr<P>(P);
+unsafe impl<P> Send for SendPtr<P> {}
+unsafe impl<P> Sync for SendPtr<P> {}
 
 impl<T> QDLDLWorkspace<T>
 where
@@ -355,6 +391,35 @@ where
             &mut etree,
         )?;
 
+        // wavefront schedule: group nodes by elimination-tree height. Parents
+        // always have larger indices than their children, so a single ascending
+        // pass computes heights.
+        let n = triuA.ncols();
+        let mut height = vec![0usize; n];
+        for k in 0..n {
+            let p = etree[k];
+            if p != QDLDL_UNKNOWN {
+                height[p] = height[p].max(height[k] + 1);
+            }
+        }
+        let maxh = height.iter().copied().max().unwrap_or(0);
+        // counting sort of nodes 1..n by height (node 0 is handled separately
+        // by the factorization prologue)
+        let mut wf_offsets = vec![0usize; maxh + 2];
+        for k in 1..n {
+            wf_offsets[height[k] + 1] += 1;
+        }
+        for h in 0..(maxh + 1) {
+            wf_offsets[h + 1] += wf_offsets[h];
+        }
+        let mut wf_order = vec![0usize; n.saturating_sub(1)];
+        let mut pos = wf_offsets.clone();
+        for k in 1..n {
+            let h = height[k];
+            wf_order[pos[h]] = k;
+            pos[h] += 1;
+        }
+
         // positive inertia count.
         let positive_inertia = 0;
 
@@ -375,6 +440,9 @@ where
             regularize_eps,
             regularize_delta,
             regularize_count,
+            wf_order,
+            wf_offsets,
+            par_scratch: Vec::new(),
         })
     }
 }
@@ -390,6 +458,16 @@ fn _factor<T: FloatT>(
         L.nzval.fill(T::one());
         D.fill(T::one());
         Dinv.fill(T::one());
+    }
+
+    // Use the wavefront-parallel numeric factorization for large problems.
+    // The serial path is kept bit-identical for small problems and for
+    // logical (symbolic-only) factorization.
+    const PARALLEL_MIN_DIM: usize = 20_000;
+    if !logical && workspace.triuA.ncols() >= PARALLEL_MIN_DIM && rayon::current_num_threads() > 1 {
+        let pos_d_count = _factor_inner_parallel(L, D, Dinv, workspace)?;
+        workspace.positive_inertia = pos_d_count;
+        return Ok(());
     }
 
     // factor using QDLDL C style converted code
@@ -666,6 +744,274 @@ fn _factor_inner<T: FloatT>(
     } //end for k
 
     Ok(positiveValuesInD)
+}
+
+// Wavefront-parallel variant of _factor_inner.
+//
+// Rows are processed in ascending elimination-tree height order; rows of equal
+// height are processed in parallel. Safety of the shared mutation relies on
+// standard elimination-tree structure properties:
+//
+//   * the sparsity pattern of row k of L (the columns its triangular solve
+//     reads, and the columns it appends one entry to) consists only of
+//     DESCENDANTS of k in the elimination tree;
+//   * every entry of column j of L is written by a row that is an ANCESTOR of
+//     j; ancestors of j form a chain with strictly increasing heights (and
+//     strictly increasing row indices), so within one wavefront at most one
+//     row touches any given column, appends across wavefronts occur in
+//     ascending row order (preserving CSC ordering), and every column read by
+//     a row was completed at strictly lower heights;
+//   * two rows of equal height have disjoint descendant sets (a common
+//     descendant would make one an ancestor of the other, contradicting equal
+//     heights).
+//
+// D[k]/Dinv[k] are written only by row k and read only for descendants
+// (strictly lower heights). Each worker uses its own y workspace. Results are
+// bitwise identical to the serial factorization: every entry is computed from
+// the same inputs with the same inner loop order, independent of scheduling.
+#[allow(non_snake_case)]
+fn _factor_inner_parallel<T: FloatT>(
+    L: &mut CscMatrix<T>,
+    D: &mut [T],
+    Dinv: &mut [T],
+    workspace: &mut QDLDLWorkspace<T>,
+) -> Result<usize, QDLDLError> {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let A = &workspace.triuA;
+    let n = A.n;
+    let (Ap, Ai, Ax) = (&A.colptr, &A.rowval, &A.nzval);
+    let Lnz = &workspace.Lnz;
+    let etree = &workspace.etree;
+    let Dsigns = &workspace.Dsigns;
+    let regularize_enable = workspace.regularize_enable;
+    let regularize_eps = workspace.regularize_eps;
+    let regularize_delta = workspace.regularize_delta;
+
+    let nthreads = rayon::current_num_threads();
+    if workspace.par_scratch.len() < nthreads || workspace.par_scratch.first().is_some_and(|w| w.y_vals.len() != n) {
+        workspace.par_scratch = (0..nthreads).map(|_| ParScratch::new(n)).collect();
+    }
+
+    // prologue, identical to _factor_inner: Lp = cumsum(Lnz) and the first
+    // diagonal element
+    let Lp = &mut L.colptr;
+    Lp[0] = 0;
+    let mut acc = 0;
+    for (Lp, Lnz) in zip(&mut Lp[1..], Lnz) {
+        acc += Lnz;
+        *Lp = acc;
+    }
+
+    D.fill(T::zero());
+    // next available space in each column of L; stored in the same iwork
+    // segment the serial code uses, though only this function touches it here
+    let (_, iwork) = workspace.iwork.split_at_mut(n);
+    let (_, next_colspace) = iwork.split_at_mut(n);
+    next_colspace.copy_from_slice(&Lp[0..Lp.len() - 1]);
+
+    let mut regularize_count_total = 0usize;
+    let mut positive_total = 0usize;
+
+    D[0] = Ax[0];
+    if regularize_enable {
+        let sign = T::from_i8(Dsigns[0]).unwrap();
+        if D[0] * sign < regularize_eps {
+            D[0] = regularize_delta * sign;
+            regularize_count_total += 1;
+        }
+    }
+    if D[0].is_zero() {
+        return Err(QDLDLError::ZeroPivot);
+    }
+    if D[0] > T::zero() {
+        positive_total += 1;
+    }
+    Dinv[0] = T::recip(D[0]);
+
+    // shared outputs, mutated disjointly per the wavefront argument above
+    let Lp_ptr = SendPtr(Lp.as_ptr());
+    let Li_ptr = SendPtr(L.rowval.as_mut_ptr());
+    let Lx_ptr = SendPtr(L.nzval.as_mut_ptr());
+    let D_ptr = SendPtr(D.as_mut_ptr());
+    let Dinv_ptr = SendPtr(Dinv.as_mut_ptr());
+    let colspace_ptr = SendPtr(next_colspace.as_mut_ptr());
+
+    let zero_pivot = AtomicBool::new(false);
+    let positive_count = AtomicUsize::new(0);
+    let regularize_count_atomic = AtomicUsize::new(0);
+
+    // the per-row kernel; caller guarantees rows within a call batch are of
+    // equal elimination-tree height and scratch is exclusive to this call
+    let factor_row = |k: usize, scratch: &mut ParScratch<T>| -> bool {
+        let y_markers = &mut scratch.y_markers;
+        let y_idx = &mut scratch.y_idx;
+        let elim_buffer = &mut scratch.elim_buffer;
+        let y_vals = &mut scratch.y_vals;
+
+        let (Lp, Li, Lx) = (Lp_ptr, Li_ptr, Lx_ptr);
+        let (D, Dinv, next_colspace) = (D_ptr, Dinv_ptr, colspace_ptr);
+
+        let mut nnz_y = 0usize;
+        let mut dk = T::zero();
+
+        for i in Ap[k]..Ap[k + 1] {
+            let bidx = Ai[i];
+            if bidx == k {
+                dk = Ax[i];
+                continue;
+            }
+
+            y_vals[bidx] = Ax[i];
+
+            let next_idx = bidx;
+            if y_markers[next_idx] == QDLDL_UNUSED {
+                y_markers[next_idx] = QDLDL_USED;
+                elim_buffer[0] = next_idx;
+                let mut nnz_e = 1;
+
+                let mut next_idx = etree[bidx];
+                while next_idx != QDLDL_UNKNOWN && next_idx < k {
+                    if y_markers[next_idx] == QDLDL_USED {
+                        break;
+                    }
+                    y_markers[next_idx] = QDLDL_USED;
+                    elim_buffer[nnz_e] = next_idx;
+                    next_idx = etree[next_idx];
+                    nnz_e += 1;
+                }
+
+                while nnz_e != 0 {
+                    nnz_e -= 1;
+                    y_idx[nnz_y] = elim_buffer[nnz_e];
+                    nnz_y += 1;
+                }
+            }
+        }
+
+        for i in (0..nnz_y).rev() {
+            let cidx = y_idx[i];
+
+            unsafe {
+                // Safety: cidx is a descendant of k, so no other row in this
+                // wavefront reads or writes column cidx, its L entries, D, or
+                // its next_colspace slot; all entries read were completed at
+                // strictly lower wavefronts.
+                let tmp_idx = *next_colspace.0.add(cidx);
+                let y_vals_cidx = y_vals[cidx];
+
+                let (f, l) = (*Lp_ptr.0.add(cidx), tmp_idx);
+                for idx in f..l {
+                    let lij = *Li.0.add(idx);
+                    *(y_vals.get_unchecked_mut(lij)) -= *Lx.0.add(idx) * y_vals_cidx;
+                }
+
+                let lx_tmp = y_vals_cidx * *Dinv.0.add(cidx);
+                *Lx.0.add(tmp_idx) = lx_tmp;
+                dk -= y_vals_cidx * lx_tmp;
+
+                *Li.0.add(tmp_idx) = k;
+                *next_colspace.0.add(cidx) = tmp_idx + 1;
+            }
+
+            y_vals[cidx] = T::zero();
+            y_markers[cidx] = QDLDL_UNUSED;
+        }
+
+        if regularize_enable {
+            let sign = T::from_i8(Dsigns[k]).unwrap();
+            if dk * sign < regularize_eps {
+                dk = regularize_delta * sign;
+                regularize_count_atomic.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if dk.is_zero() {
+            zero_pivot.store(true, Ordering::Relaxed);
+            return false;
+        }
+        if dk > T::zero() {
+            positive_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        unsafe {
+            *D.0.add(k) = dk;
+            *Dinv.0.add(k) = T::recip(dk);
+        }
+        let _ = Lp;
+        true
+    };
+
+    // process the wavefronts; small levels run on the current thread to avoid
+    // scheduling overhead, larger ones fan out across a scope
+    const PARALLEL_MIN_LEVEL: usize = 32;
+    let wf_offsets = &workspace.wf_offsets;
+    let wf_order = &workspace.wf_order;
+
+    let mut scratches: Vec<&mut ParScratch<T>> = workspace.par_scratch.iter_mut().collect();
+
+    if std::env::var("CLARABEL_DEBUG_WF").is_ok() {
+        let nlv = wf_offsets.len() - 1;
+        let mut wide_rows = 0usize;
+        let mut wide_work = 0usize;
+        let mut total_work = 0usize;
+        for h in 0..nlv {
+            let level = &wf_order[wf_offsets[h]..wf_offsets[h + 1]];
+            let work: usize = level.iter().map(|&k| Lnz[k]).sum();
+            total_work += work;
+            if level.len() >= PARALLEL_MIN_LEVEL {
+                wide_rows += level.len();
+                wide_work += work;
+            }
+        }
+        eprintln!(
+            "CLARABEL_DEBUG_WF: n={} levels={} wide_rows={} ({:.1}%) wide_Lnz={} of {} ({:.1}%)",
+            n, nlv, wide_rows,
+            100.0 * wide_rows as f64 / (n - 1) as f64,
+            wide_work, total_work,
+            100.0 * wide_work as f64 / total_work.max(1) as f64,
+        );
+    }
+
+    for h in 0..wf_offsets.len() - 1 {
+        if zero_pivot.load(Ordering::Relaxed) {
+            break;
+        }
+        let level = &wf_order[wf_offsets[h]..wf_offsets[h + 1]];
+        if level.is_empty() {
+            continue;
+        }
+
+        if level.len() < PARALLEL_MIN_LEVEL {
+            let scratch = &mut scratches[0];
+            for &k in level {
+                if !factor_row(k, scratch) {
+                    break;
+                }
+            }
+        } else {
+            let chunk = level.len().div_ceil(scratches.len());
+            rayon::scope(|s| {
+                for (rows, scratch) in zip(level.chunks(chunk), scratches.iter_mut()) {
+                    let factor_row = &factor_row;
+                    s.spawn(move |_| {
+                        for &k in rows {
+                            if !factor_row(k, scratch) {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    if zero_pivot.load(Ordering::Relaxed) {
+        return Err(QDLDLError::ZeroPivot);
+    }
+
+    workspace.regularize_count = regularize_count_total + regularize_count_atomic.load(Ordering::Relaxed);
+    Ok(positive_total + positive_count.load(Ordering::Relaxed))
 }
 
 // Solves (L+I)x = b, with x replacing b (with standard bounds checks)
