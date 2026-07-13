@@ -46,15 +46,32 @@ where
         //here we allow scope for different KKT solvers, e.g.
         //direct vs indirect, different QR based direct methods
         //etc.   For now, we only have direct / LDL based
-        let kktsolver = if settings.direct_kkt_solver {
-            Box::new(DirectLDLKKTSolver::<T>::new(
-                &data.P,
-                &data.A,
-                cones,
-                m,
-                n,
-                settings.core(),
-            ))
+        let kktsolver: Box<dyn KKTSolver<T> + Send + Sync> = if settings.direct_kkt_solver {
+            // opt-in condensed (normal equations + Woodbury) solver for
+            // problems with the right structure; falls back to direct LDL
+            let condensed = if std::env::var("CLARABEL_CONDENSED_KKT").is_ok() {
+                crate::solver::core::kktsolvers::condensed::CondensedKKTSolver::<T>::try_new(
+                    &data.P,
+                    &data.A,
+                    cones,
+                    m,
+                    n,
+                    settings.core(),
+                )
+            } else {
+                None
+            };
+            match condensed {
+                Some(solver) => Box::new(solver),
+                None => Box::new(DirectLDLKKTSolver::<T>::new(
+                    &data.P,
+                    &data.A,
+                    cones,
+                    m,
+                    n,
+                    settings.core(),
+                )),
+            }
         } else {
             panic!("Indirect and other solve strategies not yet supported.");
         };

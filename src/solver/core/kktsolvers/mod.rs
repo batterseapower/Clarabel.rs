@@ -2,6 +2,7 @@
 use super::{cones::CompositeCone, CoreSettings};
 use crate::algebra::*;
 
+pub mod condensed;
 pub mod direct;
 
 pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
