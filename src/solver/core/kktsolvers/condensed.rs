@@ -43,18 +43,16 @@ const MAX_RANK_FRACTION: f64 = 0.05;
 // eta*u / eta*v so that H_block = diag + ub ub' - vb vb'.
 struct SocScaling<T> {
     rng: Range<usize>,
-    ub: Vec<T>,
-    vb: Vec<T>,
-    // sequential Sherman-Morrison cache for H_block = E + ub ub' - vb vb':
-    //   eu = E^{-1} ub,  d1 = 1 + ub' eu   (update; d1 >= 1 by construction)
-    //   hv = B1^{-1} vb, d2 = 1 - vb' hv   (downdate; d2 > 0 since H is PD)
-    // splitting the rank-2 into two signed rank-1 terms keeps every
-    // denominator positive and cancellation-free, unlike the coupled 2x2
-    // form whose core (J + S) can pass arbitrarily close to singularity
-    eu: Vec<T>,
-    hv: Vec<T>,
-    d1: T,
-    d2: T,
+    // H_block = eta^2 (2 w w' - J) handled as Ehat + 2 eta^2 w w' with
+    // Ehat = diag(-eta^2 c, eta^2, ..., eta^2), c = w'Jw = w0^2 - |w1:|^2.
+    // A single POSITIVE rank-1 with Sherman-Morrison denominator
+    // delta = 1 + 2 eta^2 w' Ehat^{-1} w (provably ~ -1 for c ~ 1): no
+    // near-parallel cancelling pair, unlike the (u, v) expansion form.
+    w: Vec<T>,
+    eta2: T,
+    c: T,
+    delta: T,
+    euw: Vec<T>, // Ehat^{-1} w
 }
 
 // copy of one dense-form SOC scaling (w point and eta^2); the block and its
@@ -106,6 +104,7 @@ pub struct CondensedKKTSolver<T> {
     k: usize,
     soc_col_offset: usize,
     soc_col_scale: Vec<T>,
+    thick_col_scale: Vec<T>,
     U: Vec<T>,
     Y: Vec<T>,
     core: Vec<T>,
@@ -189,6 +188,11 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         // dense-SOC rows are handled exactly through closed-form pair
         // contributions to M_sp below; exclude them from both thin (diagonal
         // D^{-1}) and thick (low-rank) treatments
+        // the first row of each sparse SOC carries the negative Ehat entry and
+        // must go through the (sign-aware) thick machinery, not M_sp
+        for rng in &soc_rngs {
+            is_thick[rng.start] = true;
+        }
         let mut is_dense_soc_row = vec![false; m];
         for rng in &dense_soc_rngs {
             for r in rng.clone() {
@@ -200,7 +204,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let thin_rows: Vec<usize> =
             (0..m).filter(|&r| !is_thick[r] && !is_dense_soc_row[r]).collect();
 
-        let k = thick_rows.len() + 2 * soc_rngs.len();
+        let n_thick = thick_rows.len();
+        let k = n_thick + soc_rngs.len();
         if k > ((n as f64) * MAX_RANK_FRACTION) as usize + 16 {
             return None;
         }
@@ -308,12 +313,11 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         let socs = soc_rngs
             .into_iter()
             .map(|rng| SocScaling {
-                ub: vec![T::zero(); rng.len()],
-                vb: vec![T::zero(); rng.len()],
-                eu: vec![T::zero(); rng.len()],
-                hv: vec![T::zero(); rng.len()],
-                d1: T::one(),
-                d2: T::one(),
+                w: vec![T::zero(); rng.len()],
+                eta2: T::one(),
+                c: T::one(),
+                delta: -T::one(),
+                euw: vec![T::zero(); rng.len()],
                 rng,
             })
             .collect();
@@ -378,7 +382,8 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             ldl,
             k,
             soc_col_offset,
-            soc_col_scale: vec![T::one(); 2 * socs_len],
+            soc_col_scale: vec![T::one(); socs_len],
+            thick_col_scale: vec![T::one(); n_thick],
             U,
             Y: vec![T::zero(); n * k],
             core: vec![T::zero(); k * k],
@@ -393,7 +398,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     }
 
     // refresh hdiag/dinv and the SOC scaling snapshots from the cones
-    fn refresh_scalings(&mut self, cones: &CompositeCone<T>) {
+    fn refresh_scalings(&mut self, cones: &CompositeCone<T>) -> bool {
         let mut soc_i = 0usize;
         let mut dsoc_i = 0usize;
         for (cone, rng) in zip(cones.iter(), cones.rng_cones.iter()) {
@@ -402,36 +407,20 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                     cone.get_Hs(&mut self.hdiag[rng.clone()]);
                 }
                 SupportedCone::SecondOrderCone(c) => {
-                    if let Some(sd) = &c.sparse_data {
-                        // Hs diagonal = eta^2 * [d, 1, 1, ...]
-                        cone.get_Hs(&mut self.hdiag[rng.clone()]);
+                    if c.sparse_data.is_some() {
                         let soc = &mut self.socs[soc_i];
                         soc_i += 1;
-                        for (i, (ub, vb)) in zip(&mut soc.ub, &mut soc.vb).enumerate() {
-                            *ub = c.η * sd.u[i];
-                            *vb = c.η * sd.v[i];
+                        soc.eta2 = c.η * c.η;
+                        soc.w.copy_from_slice(&c.w);
+                        let mut cjw = c.w[0] * c.w[0];
+                        for wi in &c.w[1..] {
+                            cjw -= *wi * *wi;
                         }
-                        if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
-                            // self-check the rank-2 snapshot against the exact
-                            // H = eta^2 (2ww' - J) on a deterministic vector
-                            let d = rng.len();
-                            let x: Vec<T> = (0..d)
-                                .map(|i| T::from_f64(((i * 7919 + 13) % 17) as f64 / 8.5 - 1.0).unwrap())
-                                .collect();
-                            let eta2 = c.η * c.η;
-                            let wx: T = zip(&c.w, &x).fold(T::zero(), |acc, (a, b)| acc + *a * *b);
-                            let two = T::from_f64(2.0).unwrap();
-                            let mut yex: Vec<T> = zip(&c.w, &x).map(|(w, xi)| eta2 * two * wx * *w + eta2 * *xi).collect();
-                            yex[0] -= eta2 * two * x[0];
-                            let soc2 = &self.socs[soc_i - 1];
-                            let ux: T = zip(&soc2.ub, &x).fold(T::zero(), |acc, (a, b)| acc + *a * *b);
-                            let vx: T = zip(&soc2.vb, &x).fold(T::zero(), |acc, (a, b)| acc + *a * *b);
-                            let mut err = T::zero();
-                            for i in 0..d {
-                                let ymine = self.hdiag[rng.start + i] * x[i] + soc2.ub[i] * ux - soc2.vb[i] * vx;
-                                err = T::max(err, (ymine - yex[i]).abs());
-                            }
-                            eprintln!("soc rank2 self-check: dim={} err={:?}", d, err.to_f64());
+                        soc.c = cjw;
+                        // Ehat diagonal
+                        self.hdiag[rng.start] = -soc.eta2 * cjw;
+                        for r in (rng.start + 1)..rng.end {
+                            self.hdiag[r] = soc.eta2;
                         }
                     } else {
                         let ds = &mut self.dense_socs[dsoc_i];
@@ -460,6 +449,24 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             self.dinv[r] = T::recip(self.hdiag[r]);
         }
 
+        // w-form Sherman-Morrison cache per sparse SOC. |delta| must be
+        // significantly nonzero; for a valid NT scaling it sits near -1, so a
+        // tiny computed value signals unresolvable data and we decline the
+        // update (caller falls back / strategy handles it).
+        for si in 0..self.socs.len() {
+            let soc = &mut self.socs[si];
+            let two = T::from_f64(2.0).unwrap();
+            let mut wew = T::zero();
+            for (i, r) in soc.rng.clone().enumerate() {
+                soc.euw[i] = self.dinv[r] * soc.w[i];
+                wew += soc.w[i] * soc.euw[i];
+            }
+            soc.delta = T::one() + two * soc.eta2 * wew;
+            if soc.delta.abs() <= T::from_f64(1e-10).unwrap() {
+                return false;
+            }
+        }
+
         if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
             let x: Vec<T> = (0..self.m)
                 .map(|i| T::from_f64(((i * 7919 + 13) % 17) as f64 / 8.5 - 1.0).unwrap())
@@ -482,6 +489,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
                 err.to_f64(), argmax, self.hdiag[argmax].to_f64(), x[argmax].to_f64(), z[argmax].to_f64()
             );
         }
+        true
     }
 
     // y = P x (symmetric, P stored triu)
@@ -535,14 +543,16 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             y[r] = self.hdiag[r] * z[r];
         }
         for soc in &self.socs {
-            let mut du = T::zero();
-            let mut dv = T::zero();
+            // y_block = eta^2 (2 (w.z) w - J z); overwrite (diag init above is
+            // Ehat-based which is NOT the diagonal of H here)
+            let two = T::from_f64(2.0).unwrap();
+            let mut wz = T::zero();
             for (i, r) in soc.rng.clone().enumerate() {
-                du += soc.ub[i] * z[r];
-                dv += soc.vb[i] * z[r];
+                wz += soc.w[i] * z[r];
             }
             for (i, r) in soc.rng.clone().enumerate() {
-                y[r] += soc.ub[i] * du - soc.vb[i] * dv;
+                let jz = if i == 0 { z[r] } else { -z[r] };
+                y[r] = soc.eta2 * (two * wz * soc.w[i] - jz);
             }
         }
         for ds in &self.dense_socs {
@@ -566,22 +576,16 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             z[r] = self.dinv[r] * w[r];
         }
         for soc in &self.socs {
-            // sequential Sherman-Morrison: z = B1^{-1} w then downdate
-            let mut a1 = T::zero();
+            // z holds Ehat^{-1} rhs on the block (sign-aware dinv);
+            // H^{-1} = Ehat^{-1} - (2 eta^2 / delta) euw euw'
+            let two = T::from_f64(2.0).unwrap();
+            let mut wz = T::zero();
             for (i, r) in soc.rng.clone().enumerate() {
-                a1 += soc.ub[i] * z[r]; // ub' E^{-1} w  (z holds E^{-1} w here)
+                wz += soc.w[i] * z[r];
             }
-            a1 = a1 / soc.d1;
+            let alpha = two * soc.eta2 * wz / soc.delta;
             for (i, r) in soc.rng.clone().enumerate() {
-                z[r] -= soc.eu[i] * a1;
-            }
-            let mut a2 = T::zero();
-            for (i, r) in soc.rng.clone().enumerate() {
-                a2 += soc.vb[i] * z[r]; // vb' B1^{-1} w
-            }
-            a2 = a2 / soc.d2;
-            for (i, r) in soc.rng.clone().enumerate() {
-                z[r] += soc.hv[i] * a2;
+                z[r] -= soc.euw[i] * alpha;
             }
         }
         for ds in &self.dense_socs {
@@ -692,33 +696,8 @@ impl<T: FloatT> HasLinearSolverInfo for CondensedKKTSolver<T> {
 
 impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
     fn update(&mut self, cones: &CompositeCone<T>, _settings: &CoreSettings<T>) -> bool {
-        self.refresh_scalings(cones);
-
-        // sequential-SM cache per sparse SOC (see SocScaling). d2 must be
-        // significantly positive: H is PD in exact arithmetic, so a computed
-        // d2 at rounding-noise scale means the downdate is not resolvable in
-        // f64 and we decline the update (caller falls back).
-        for si in 0..self.socs.len() {
-            let soc = &mut self.socs[si];
-            let mut d1 = T::one();
-            for (i, r) in soc.rng.clone().enumerate() {
-                soc.eu[i] = self.dinv[r] * soc.ub[i];
-                d1 += soc.ub[i] * soc.eu[i];
-            }
-            soc.d1 = d1;
-            let mut t = T::zero();
-            for (i, _r) in soc.rng.clone().enumerate() {
-                t += soc.vb[i] * soc.eu[i];
-            }
-            let mut d2 = T::one();
-            for (i, r) in soc.rng.clone().enumerate() {
-                soc.hv[i] = self.dinv[r] * soc.vb[i] - soc.eu[i] * (t / d1);
-                d2 -= soc.vb[i] * soc.hv[i];
-            }
-            soc.d2 = d2;
-            if !(d2 > T::from_f64(1e-13).unwrap()) {
-                return false;
-            }
+        if !self.refresh_scalings(cones) {
+            return false;
         }
 
         // numeric M_sp
@@ -773,44 +752,44 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         for (uc, &r) in self.thick_rows.iter().enumerate() {
             let col = &mut self.U[uc * self.n..(uc + 1) * self.n];
             col.fill(T::zero());
-            let sc = self.dinv[r].sqrt();
+            let sc = self.dinv[r].abs().sqrt();
+            let mut mx = T::zero();
             for i in self.At.colptr[r]..self.At.colptr[r + 1] {
-                col[self.At.rowval[i]] = self.At.nzval[i] * sc;
+                let v = self.At.nzval[i] * sc;
+                col[self.At.rowval[i]] = v;
+                mx = T::max(mx, v.abs());
             }
+            // normalize to unit inf norm so every core entry is O(1)-scaled;
+            // the scale moves into the C^{-1} entry
+            let cs = if mx > T::zero() { mx } else { T::one() };
+            let inv = T::recip(cs);
+            for i in self.At.colptr[r]..self.At.colptr[r + 1] {
+                col[self.At.rowval[i]] *= inv;
+            }
+            self.thick_col_scale[uc] = cs;
         }
 
-        // sparse-SOC U columns: A' (dinv .* ub), A' (dinv .* vb)
+        // sparse-SOC U column (one per SOC): g = A' (Ehat^{-1} w), normalized
         for (si, soc) in self.socs.iter().enumerate() {
-            let base = (self.soc_col_offset + 2 * si) * self.n;
-            let (left, right) = self.U.split_at_mut(base + self.n);
-            let ucol = &mut left[base..];
-            let vcol = &mut right[..self.n];
-            ucol.fill(T::zero());
-            vcol.fill(T::zero());
+            let base = (self.soc_col_offset + si) * self.n;
+            let col = &mut self.U[base..base + self.n];
+            col.fill(T::zero());
             for (i, r) in soc.rng.clone().enumerate() {
-                let gu = soc.eu[i];
-                let gv = soc.hv[i];
+                let g = soc.euw[i];
                 for j in self.At.colptr[r]..self.At.colptr[r + 1] {
-                    let c = self.At.rowval[j];
-                    let v = self.At.nzval[j];
-                    ucol[c] += v * gu;
-                    vcol[c] += v * gv;
+                    col[self.At.rowval[j]] += self.At.nzval[j] * g;
                 }
             }
-            // normalize both columns to unit inf norm (scales absorbed by the
-            // core C^{-1} block) to keep the Woodbury core well conditioned
-            for (off, col) in [(0usize, ucol), (1usize, vcol)] {
-                let mut mx = T::zero();
-                for v in col.iter() {
-                    mx = T::max(mx, v.abs());
-                }
-                let sc = if mx > T::zero() { mx } else { T::one() };
-                let inv = T::recip(sc);
-                for v in col.iter_mut() {
-                    *v *= inv;
-                }
-                self.soc_col_scale[2 * si + off] = sc;
+            let mut mx = T::zero();
+            for v in col.iter() {
+                mx = T::max(mx, v.abs());
             }
+            let sc = if mx > T::zero() { mx } else { T::one() };
+            let inv = T::recip(sc);
+            for v in col.iter_mut() {
+                *v *= inv;
+            }
+            self.soc_col_scale[si] = sc;
         }
 
         // Y = M_sp^{-1} U
@@ -821,17 +800,19 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
 
         // core = C^{-1} + U' Y
         self.core.fill(T::zero());
-        for uc in 0..self.thick_rows.len() {
-            self.core[uc * self.k + uc] = T::one();
+        for (uc, &r) in self.thick_rows.iter().enumerate() {
+            // C^{-1} = sign(hdiag) / s^2 after |dinv|- and inf-norm scaling
+            let cs = self.thick_col_scale[uc];
+            let sgn = if self.hdiag[r] > T::zero() { T::one() } else { -T::one() };
+            self.core[uc * self.k + uc] = sgn / (cs * cs);
         }
-        // sparse-SOC rank-1 pair: two decoupled entries; contribution to M is
-        //   - g1 g1'/d1 + g2 g2'/d2  with columns normalized by su, sv
+        // sparse-SOC single rank-1: contribution to M is -(2 eta^2/delta) g g'
+        // with the column normalized by s, so C^{-1} = -delta / (2 eta^2 s^2)
         for (si, soc) in self.socs.iter().enumerate() {
-            let base = self.soc_col_offset + 2 * si;
-            let su = self.soc_col_scale[2 * si];
-            let sv = self.soc_col_scale[2 * si + 1];
-            self.core[base * self.k + base] = -soc.d1 / (su * su);
-            self.core[(base + 1) * self.k + (base + 1)] = soc.d2 / (sv * sv);
+            let base = self.soc_col_offset + si;
+            let sc = self.soc_col_scale[si];
+            let two = T::from_f64(2.0).unwrap();
+            self.core[base * self.k + base] = -soc.delta / (two * soc.eta2 * sc * sc);
         }
 
         for cj in 0..self.k {
@@ -957,32 +938,30 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 }
             }
             // U C U' x0: thick block C = I; soc pairs C = -core2^{-1} (scaled)
-            for uc in 0..self.thick_rows.len() {
+            for (uc, &rr) in self.thick_rows.iter().enumerate() {
                 let col = &self.U[uc * self.n..(uc + 1) * self.n];
                 let mut acc = T::zero();
                 for (ci, xi) in zip(col, x0.iter()) {
                     acc += *ci * *xi;
                 }
+                let cs = self.thick_col_scale[uc];
+                let sgn = if self.hdiag[rr] > T::zero() { T::one() } else { -T::one() };
                 for i in 0..self.n {
-                    fwd[i] += col[i] * acc;
+                    fwd[i] += col[i] * (sgn * cs * cs * acc);
                 }
             }
             for (si, soc) in self.socs.iter().enumerate() {
-                let base = self.soc_col_offset + 2 * si;
-                let su = self.soc_col_scale[2 * si];
-                let sv = self.soc_col_scale[2 * si + 1];
+                let base = self.soc_col_offset + si;
+                let sc = self.soc_col_scale[si];
                 let ucol = &self.U[base * self.n..(base + 1) * self.n];
-                let vcol = &self.U[(base + 1) * self.n..(base + 2) * self.n];
                 let mut pu = T::zero();
-                let mut pv = T::zero();
                 for i in 0..self.n {
                     pu += ucol[i] * x0[i];
-                    pv += vcol[i] * x0[i];
                 }
-                let cu = -(su * su) / soc.d1;
-                let cv = (sv * sv) / soc.d2;
+                let two = T::from_f64(2.0).unwrap();
+                let cu = -(two * soc.eta2 * sc * sc) / soc.delta;
                 for i in 0..self.n {
-                    fwd[i] += ucol[i] * (cu * pu) + vcol[i] * (cv * pv);
+                    fwd[i] += ucol[i] * (cu * pu);
                 }
             }
             let mut ferr = T::zero();
@@ -1019,16 +998,26 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 "M woodbury roundtrip: err={:?} argmax={} | forward assembly err={:?} | core LU err={:?} |wk|={:?}",
                 err.to_f64(), amax, ferr.to_f64(), luerr.to_f64(), wkmax.to_f64()
             );
+            if let Ok(dir) = std::env::var("CLARABEL_CONDENSED_DUMP_CORE") {
+                use std::io::Write;
+                let mut f = std::fs::File::create(format!("{dir}/core.f64")).unwrap();
+                for v in cd.iter() {
+                    f.write_all(&v.to_f64().unwrap().to_le_bytes()).unwrap();
+                }
+                let mut f = std::fs::File::create(format!("{dir}/rhs.f64")).unwrap();
+                for v in rhs_k.iter() {
+                    f.write_all(&v.to_f64().unwrap().to_le_bytes()).unwrap();
+                }
+            }
             for (si, soc) in self.socs.iter().enumerate() {
-                let base = self.soc_col_offset + 2 * si;
+                let base = self.soc_col_offset + si;
                 eprintln!(
-                    "  soc{}: su={:?} sv={:?} Cinv=[{:?} {:?}; . {:?}]",
+                    "  soc{}: s={:?} delta={:?} c={:?} core_diag={:?}",
                     si,
-                    self.soc_col_scale[2 * si].to_f64(),
-                    self.soc_col_scale[2 * si + 1].to_f64(),
+                    self.soc_col_scale[si].to_f64(),
+                    soc.delta.to_f64(),
+                    soc.c.to_f64(),
                     cd[base * self.k + base].to_f64(),
-                    cd[(base + 1) * self.k + base].to_f64(),
-                    cd[(base + 1) * self.k + (base + 1)].to_f64(),
                 );
             }
         }
@@ -1168,8 +1157,14 @@ fn dense_lu_factor<T: FloatT>(a: &mut [T], k: usize, piv: &mut [usize]) -> bool 
 }
 
 fn dense_lu_solve<T: FloatT>(a: &[T], piv: &[usize], k: usize, b: &mut [T]) {
+    // apply ALL row interchanges first (LAPACK laswp semantics): the stored L
+    // multipliers refer to final row positions, so interleaving swaps with
+    // the forward substitution silently mismatches rows permuted by later
+    // pivots
     for col in 0..k {
         b.swap(col, piv[col]);
+    }
+    for col in 0..k {
         let bc = b[col];
         for r in (col + 1)..k {
             b[r] -= a[col * k + r] * bc;
