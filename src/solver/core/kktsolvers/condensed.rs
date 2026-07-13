@@ -656,8 +656,16 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         for c in 0..self.k {
             let col = &self.U[c * self.n..(c + 1) * self.n];
             let mut acc = T::zero();
-            for (ci, xi) in zip(col, x.iter()) {
-                acc += *ci * *xi;
+            if c < self.soc_col_offset {
+                let r = self.thick_rows[c];
+                for j in self.At.colptr[r]..self.At.colptr[r + 1] {
+                    let idx = self.At.rowval[j];
+                    acc += col[idx] * x[idx];
+                }
+            } else {
+                for (ci, xi) in zip(col, x.iter()) {
+                    acc += *ci * *xi;
+                }
             }
             wk[c] = acc;
         }
@@ -831,6 +839,9 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 .for_each(|(cj, corecol)| {
                     let ycol = &Y[cj * n..(cj + 1) * n];
                     for (ci, item) in corecol.iter_mut().enumerate() {
+                        if ci < cj {
+                            continue; // symmetric: mirrored after the loop
+                        }
                         let ucol = &U[ci * n..(ci + 1) * n];
                         let mut acc = T::zero();
                         if ci < soc_col_offset {
@@ -847,6 +858,11 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                         *item += acc;
                     }
                 });
+            for cj in 0..kk {
+                for ci in 0..cj {
+                    self.core[cj * kk + ci] = self.core[ci * kk + cj];
+                }
+            }
         }
 
         let core_dbg = if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
