@@ -792,11 +792,9 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             self.soc_col_scale[si] = sc;
         }
 
-        // Y = M_sp^{-1} U
+        // Y = M_sp^{-1} U (parallel multi-RHS)
         self.Y.copy_from_slice(&self.U);
-        for c in 0..self.k {
-            self.ldl.solve(&mut self.Y[c * self.n..(c + 1) * self.n]);
-        }
+        self.ldl.solve_parallel(&mut self.Y, self.k);
 
         // core = C^{-1} + U' Y
         self.core.fill(T::zero());
@@ -815,16 +813,40 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             self.core[base * self.k + base] = -soc.delta / (two * soc.eta2 * sc * sc);
         }
 
-        for cj in 0..self.k {
-            let ycol = &self.Y[cj * self.n..(cj + 1) * self.n];
-            for ci in 0..self.k {
-                let ucol = &self.U[ci * self.n..(ci + 1) * self.n];
-                let mut acc = T::zero();
-                for (u, y) in zip(ucol, ycol) {
-                    acc += *u * *y;
-                }
-                self.core[cj * self.k + ci] += acc;
-            }
+        // core += U'Y. Thick U columns are sparse (scaled constraint rows), so
+        // dot them through their nonzero patterns; only the per-SOC columns
+        // are dense. Parallel over the k right-hand columns.
+        {
+            use rayon::prelude::*;
+            let kk = self.k;
+            let n = self.n;
+            let U = &self.U;
+            let Y = &self.Y;
+            let At = &self.At;
+            let thick_rows = &self.thick_rows;
+            let soc_col_offset = self.soc_col_offset;
+            self.core
+                .par_chunks_mut(kk)
+                .enumerate()
+                .for_each(|(cj, corecol)| {
+                    let ycol = &Y[cj * n..(cj + 1) * n];
+                    for (ci, item) in corecol.iter_mut().enumerate() {
+                        let ucol = &U[ci * n..(ci + 1) * n];
+                        let mut acc = T::zero();
+                        if ci < soc_col_offset {
+                            let r = thick_rows[ci];
+                            for j in At.colptr[r]..At.colptr[r + 1] {
+                                let idx = At.rowval[j];
+                                acc += ucol[idx] * ycol[idx];
+                            }
+                        } else {
+                            for (u, y) in zip(ucol, ycol) {
+                                acc += *u * *y;
+                            }
+                        }
+                        *item += acc;
+                    }
+                });
         }
 
         let core_dbg = if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {

@@ -113,6 +113,29 @@ where
 
     /// Solves Ax = b using LDL factors for A.
     /// Solves in place (x replaces b)
+    /// Solve many right-hand sides in parallel. `bs` holds `nrhs` contiguous
+    /// vectors of length n; each is replaced by its solution. Read-only over
+    /// the factorization (per-RHS scratch is allocated by the caller thread).
+    pub fn solve_parallel(&self, bs: &mut [T], nrhs: usize) {
+        assert!(!self.is_symbolic);
+        let n = self.D.len();
+        assert_eq!(bs.len(), n * nrhs);
+
+        use rayon::prelude::*;
+        bs.par_chunks_mut(n).for_each(|b| {
+            let mut tmp = vec![T::zero(); n];
+            permute(&mut tmp, b, &self.perm);
+            _solve(
+                &self.L.colptr,
+                &self.L.rowval,
+                &self.L.nzval,
+                &self.Dinv,
+                &mut tmp,
+            );
+            ipermute(b, &tmp, &self.perm);
+        });
+    }
+
     pub fn solve(&mut self, b: &mut [T]) {
         // bomb if logical factorisation only
         assert!(!self.is_symbolic);
