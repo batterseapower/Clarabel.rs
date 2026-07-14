@@ -612,32 +612,35 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         }
     }
 
+    // Both products are written as gathers rather than the usual CSC scatter: a
+    // scatter has to be serial (many columns write the same output entry), while
+    // a gather makes every output entry an independent dot product over the
+    // transposed factor we already keep, so it parallelizes with no reduction.
+    // The arithmetic per entry is unchanged, so results are bitwise identical to
+    // the serial scatter up to the summation order within one output entry (which
+    // is itself unchanged: it follows the transposed column's nonzero order).
     fn A_mul(&self, y: &mut [T], x: &[T]) {
-        y.fill(T::zero());
-        let A = &self.A;
-        for col in 0..self.n {
-            let xc = x[col];
-            if xc == T::zero() {
-                continue;
+        use rayon::prelude::*;
+        let At = &self.At;
+        y.par_iter_mut().enumerate().for_each(|(r, yr)| {
+            let mut acc = T::zero();
+            for i in At.colptr[r]..At.colptr[r + 1] {
+                acc += At.nzval[i] * x[At.rowval[i]];
             }
-            for i in A.colptr[col]..A.colptr[col + 1] {
-                y[A.rowval[i]] += A.nzval[i] * xc;
-            }
-        }
+            *yr = acc;
+        });
     }
 
     fn At_mul(&self, y: &mut [T], z: &[T]) {
-        y.fill(T::zero());
-        let At = &self.At;
-        for col in 0..self.m {
-            let zc = z[col];
-            if zc == T::zero() {
-                continue;
+        use rayon::prelude::*;
+        let A = &self.A;
+        y.par_iter_mut().enumerate().for_each(|(c, yc)| {
+            let mut acc = T::zero();
+            for i in A.colptr[c]..A.colptr[c + 1] {
+                acc += A.nzval[i] * z[A.rowval[i]];
             }
-            for i in At.colptr[col]..At.colptr[col + 1] {
-                y[At.rowval[i]] += At.nzval[i] * zc;
-            }
-        }
+            *yc = acc;
+        });
     }
 
     // y = H z using the scaling snapshots
