@@ -127,6 +127,10 @@ pub struct CondensedKKTSolver<T> {
 
     static_reg: T,
 
+    // symmetric equilibration of M_aug: everything downstream of the LDL (the
+    // factor, U, Y, the core, and the solves) lives in the scaled space
+    dscale: Vec<T>,
+
     // set when solves showed that the condensed operator is not an adequate
     // preconditioner for the exact KKT system (refinement could not reach
     // tolerance, or keeps stalling).  The caller then reverts to the direct solver.
@@ -480,6 +484,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             work_m: vec![T::zero(); m],
             work_k: vec![T::zero(); k],
             static_reg: settings.static_regularization_constant,
+            dscale: vec![T::one(); nn],
             degraded: false,
             timing: [0.0; 8],
             n_solve_once: 0,
@@ -773,9 +778,12 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             rn[self.n + ei] = bz[r];
         }
 
-        // xa = M_aug^{-1} rhs via Woodbury
+        // xa = M_aug^{-1} rhs via Woodbury, done in the equilibrated space:
+        // x = D (M'^{-1} - ...) D r
         let mut xa = std::mem::take(&mut self.work_nn2);
-        xa.copy_from_slice(&rn);
+        for i in 0..self.nn {
+            xa[i] = rn[i] * self.dscale[i];
+        }
         self.work_nn = rn;
         self.ldl.solve(&mut xa);
         let mut wk = std::mem::take(&mut self.work_k);
@@ -820,7 +828,7 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         }
         self.ldl.solve(&mut uw);
         for i in 0..self.nn {
-            xa[i] -= uw[i];
+            xa[i] = (xa[i] - uw[i]) * self.dscale[i];
         }
         self.work_nn = uw;
         self.work_k = wk;
@@ -908,6 +916,29 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         self.timing[1] += t.elapsed().as_secs_f64();
         t = std::time::Instant::now();
 
+        // symmetric equilibration M' = D M D with D = diag(|M_ii|^-1/2).  The
+        // condensed diagonal spans the whole range of the cone scalings, and the
+        // LDL of the raw matrix loses enough digits that refinement needs several
+        // passes; scaling it costs one pass over the values and buys accuracy.
+        // U (hence Y and the core) is scaled to match, so the Woodbury identity
+        // holds unchanged in the scaled space and only the rhs/solution of a
+        // solve need mapping back.
+        for (i, &di) in self.Msp_diag_idx.iter().enumerate() {
+            let d = self.Msp.nzval[di].abs();
+            self.dscale[i] = if d > T::zero() {
+                T::recip(d.sqrt())
+            } else {
+                T::one()
+            };
+        }
+        for col in 0..self.nn {
+            let dc = self.dscale[col];
+            for i in self.Msp.colptr[col]..self.Msp.colptr[col + 1] {
+                let row = self.Msp.rowval[i];
+                self.Msp.nzval[i] *= self.dscale[row] * dc;
+            }
+        }
+
         self.ldl.update_values(&self.Msp_all_idx, &self.Msp.nzval);
         if self.ldl.refactor().is_err() {
             return false;
@@ -921,6 +952,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         // thick-row U columns scaled by sqrt(dinv) so their C block is the
         // identity: keeps the Woodbury core well conditioned across the many
         // orders of magnitude the cone scalings span
+        let dscale = &self.dscale.clone();
         for (uc, &r) in self.thick_rows.iter().enumerate() {
             let col = &mut self.U[uc * self.nn..(uc + 1) * self.nn];
             col.fill(T::zero());
@@ -936,7 +968,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             let cs = if mx > T::zero() { mx } else { T::one() };
             let inv = T::recip(cs);
             for i in self.At.colptr[r]..self.At.colptr[r + 1] {
-                col[self.At.rowval[i]] *= inv;
+                let idx = self.At.rowval[i];
+                col[idx] *= inv * dscale[idx];
             }
             self.thick_col_scale[uc] = cs;
         }
@@ -958,8 +991,8 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             }
             let sc = if mx > T::zero() { mx } else { T::one() };
             let inv = T::recip(sc);
-            for v in col.iter_mut() {
-                *v *= inv;
+            for (v, d) in zip(col.iter_mut(), dscale.iter()) {
+                *v *= inv * *d;
             }
             self.soc_col_scale[si] = sc;
         }
