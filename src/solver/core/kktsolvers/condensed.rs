@@ -126,7 +126,24 @@ pub struct CondensedKKTSolver<T> {
     work_k: Vec<T>,
 
     static_reg: T,
+
+    // set when solves showed that the condensed operator is not an adequate
+    // preconditioner for the exact KKT system (refinement could not reach
+    // tolerance, or keeps stalling).  The caller then reverts to the direct solver.
+    degraded: bool,
+
+    // phase timings, reported on drop under CLARABEL_CONDENSED_TIMING
+    timing: [f64; 8],
+    n_solve_once: usize,
 }
+
+// refinement only pays off if the condensed operator contracts the residual
+// quickly, so a step that fails to halve the residual ends the loop.  What we
+// then hold is accepted only if it is within ACCEPT_FACTOR of the refinement
+// target; otherwise the condensed form is not good enough for this problem and
+// the caller reverts to the direct solver.
+const REFINE_CONTRACTION: f64 = 0.5;
+const ACCEPT_FACTOR: f64 = 1e6;
 
 fn csc_transpose<T: FloatT>(A: &CscMatrix<T>) -> CscMatrix<T> {
     let (m, n) = (A.m, A.n);
@@ -198,7 +215,11 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         // them; exactness is restored through the core matrix)
         let mut is_thick = vec![false; m];
         for r in 0..m {
-            if At.colptr[r + 1] - At.colptr[r] > THIN_ROW_NNZ {
+            let thin_limit = std::env::var("CLARABEL_CONDENSED_THIN")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(THIN_ROW_NNZ);
+            if At.colptr[r + 1] - At.colptr[r] > thin_limit {
                 is_thick[r] = true;
             }
         }
@@ -459,6 +480,9 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             work_m: vec![T::zero(); m],
             work_k: vec![T::zero(); k],
             static_reg: settings.static_regularization_constant,
+            degraded: false,
+            timing: [0.0; 8],
+            n_solve_once: 0,
         })
     }
 
@@ -713,6 +737,26 @@ impl<T: FloatT> CondensedKKTSolver<T> {
     }
 
     // one condensed solve pass: (bx, bz) -> (x, z) through the augmented factor
+    // cumulative phase timings; the last line printed for a solve is the total
+    fn report_timing(&self) {
+        if std::env::var("CLARABEL_CONDENSED_TIMING").is_err() {
+            return;
+        }
+        const NAMES: [&str; 8] = [
+            "scalings", "Msp_asm", "Msp_ldl", "U_build", "Y_solve", "core_asm", "core_LU", "solves",
+        ];
+        let parts: Vec<String> = NAMES
+            .iter()
+            .zip(self.timing.iter())
+            .map(|(nm, t)| format!("{}={:.3}", nm, t))
+            .collect();
+        eprintln!(
+            "condensed timing: cum_total={:.3}s k={} nn={} m={} solve_once={} | {}",
+            self.timing.iter().sum::<f64>(), self.k, self.nn, self.m, self.n_solve_once,
+            parts.join(" ")
+        );
+    }
+
     fn solve_once(&mut self, bx: &[T], bz: &[T], x: &mut [T], z: &mut [T]) {
         // rhs = [bx + A' H^{-1} bz ; b_eq]  (reuse z as H^{-1} bz scratch;
         // dinv is zero on equality rows so they contribute nothing here)
@@ -752,13 +796,33 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             wk[c] = acc;
         }
         dense_lu_solve(&self.core, &self.core_piv, self.k, &mut wk);
+
+        // xa -= M_sp^{-1} (U wk).  Using U and one extra sparse solve instead of
+        // the dense Y = M_sp^{-1} U keeps the whole solve in the sparse factors:
+        // U's thick columns are constraint rows, so scattering them costs far
+        // less than streaming the (nn x k) dense Y for every solve.
+        let mut uw = std::mem::take(&mut self.work_nn);
+        uw.fill(T::zero());
         for c in 0..self.k {
-            let ycol = &self.Y[c * self.nn..(c + 1) * self.nn];
             let w = wk[c];
-            for i in 0..self.nn {
-                xa[i] -= ycol[i] * w;
+            let col = &self.U[c * self.nn..(c + 1) * self.nn];
+            if c < self.soc_col_offset {
+                let r = self.thick_rows[c];
+                for j in self.At.colptr[r]..self.At.colptr[r + 1] {
+                    let idx = self.At.rowval[j];
+                    uw[idx] += col[idx] * w;
+                }
+            } else {
+                for (u, o) in zip(col, uw.iter_mut()) {
+                    *o += *u * w;
+                }
             }
         }
+        self.ldl.solve(&mut uw);
+        for i in 0..self.nn {
+            xa[i] -= uw[i];
+        }
+        self.work_nn = uw;
         self.work_k = wk;
 
         x.copy_from_slice(&xa[..self.n]);
@@ -793,9 +857,12 @@ impl<T: FloatT> HasLinearSolverInfo for CondensedKKTSolver<T> {
 
 impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
     fn update(&mut self, cones: &CompositeCone<T>, _settings: &CoreSettings<T>) -> bool {
+        let mut t = std::time::Instant::now();
         if !self.refresh_scalings(cones) {
             return false;
         }
+        self.timing[0] += t.elapsed().as_secs_f64();
+        t = std::time::Instant::now();
 
         // numeric M_sp
         self.Msp.nzval.fill(T::zero());
@@ -838,10 +905,15 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             self.Msp.nzval[di] += if i < self.n { reg } else { -reg };
         }
 
+        self.timing[1] += t.elapsed().as_secs_f64();
+        t = std::time::Instant::now();
+
         self.ldl.update_values(&self.Msp_all_idx, &self.Msp.nzval);
         if self.ldl.refactor().is_err() {
             return false;
         }
+        self.timing[2] += t.elapsed().as_secs_f64();
+        t = std::time::Instant::now();
         if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
             eprintln!("Msp refactor: regularize_count={}", self.ldl.regularize_count());
         }
@@ -892,9 +964,14 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             self.soc_col_scale[si] = sc;
         }
 
+        self.timing[3] += t.elapsed().as_secs_f64();
+        t = std::time::Instant::now();
+
         // Y = M_sp^{-1} U (parallel multi-RHS)
         self.Y.copy_from_slice(&self.U);
         self.ldl.solve_parallel(&mut self.Y, self.k);
+        self.timing[4] += t.elapsed().as_secs_f64();
+        t = std::time::Instant::now();
 
         // core = C^{-1} + U' Y
         self.core.fill(T::zero());
@@ -957,22 +1034,27 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             }
         }
 
+        self.timing[5] += t.elapsed().as_secs_f64();
+        t = std::time::Instant::now();
+
         let core_dbg = if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
             Some(self.core.clone())
         } else {
             None
         };
         let ok = self.k == 0 || dense_lu_factor(&mut self.core, self.k, &mut self.core_piv);
+        self.timing[6] += t.elapsed().as_secs_f64();
+        self.report_timing();
 
         if std::env::var("CLARABEL_CONDENSED_DEBUG").is_ok() {
             // LDL accuracy: e = Msp (ldl^{-1} y) - y
-            let y0: Vec<T> = (0..self.n)
+            let y0: Vec<T> = (0..self.nn)
                 .map(|i| T::from_f64(((i * 48271) % 89) as f64 / 44.5 - 1.0).unwrap())
                 .collect();
             let mut x = y0.clone();
             self.ldl.solve(&mut x);
-            let mut e = vec![T::zero(); self.n];
-            for col in 0..self.n {
+            let mut e = vec![T::zero(); self.nn];
+            for col in 0..self.nn {
                 let xc = x[col];
                 for i in self.Msp.colptr[col]..self.Msp.colptr[col + 1] {
                     let row = self.Msp.rowval[i];
@@ -984,7 +1066,7 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 }
             }
             let mut lerr = T::zero();
-            for i in 0..self.n {
+            for i in 0..self.nn {
                 lerr = T::max(lerr, (e[i] - y0[i]).abs());
             }
             eprintln!("ldl(Msp) accuracy: err={:?} regularize_count={}", lerr.to_f64(), self.ldl.regularize_count());
@@ -1165,11 +1247,13 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         lhsz: Option<&mut [T]>,
         settings: &CoreSettings<T>,
     ) -> bool {
+        let t_solve = std::time::Instant::now();
         let bx = self.bx.clone();
         let bz = self.bz.clone();
         let mut x = vec![T::zero(); self.n];
         let mut z = vec![T::zero(); self.m];
         self.solve_once(&bx, &bz, &mut x, &mut z);
+        self.n_solve_once += 1;
 
         // iterative refinement against the exact KKT operator (the condensed
         // solve loses roughly half the digits of the quasidefinite approach,
@@ -1193,12 +1277,16 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         if debug {
             eprintln!("condensed solve: normb={:?} raw norme={:?}", normb.to_f64(), norme.to_f64());
         }
+        let contraction: T = REFINE_CONTRACTION.as_T();
+        let mut steps = 0usize;
+        let mut stalled = false;
         for _ in 0..maxiter {
             if !norme.is_finite() || norme <= target {
                 break;
             }
             let last = norme;
             self.solve_once(&rx, &rz, &mut dx, &mut dz);
+            self.n_solve_once += 1;
             for i in 0..self.n {
                 dx[i] += x[i];
             }
@@ -1209,21 +1297,39 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
             if !newe.is_finite() || newe >= last {
                 // no improvement; keep the previous iterate
                 let _ = self.kkt_residual(&x, &z, &mut rx, &mut rz);
+                stalled = true;
                 break;
             }
             std::mem::swap(&mut x, &mut dx);
             std::mem::swap(&mut z, &mut dz);
             norme = newe;
+            steps += 1;
             if debug {
                 eprintln!("condensed refine: norme={:?}", norme.to_f64());
+            }
+            if newe > contraction * last {
+                // the condensed operator is a poor preconditioner here: further
+                // refinement is not worth its cost, and the iterate we have may
+                // well be inaccurate
+                stalled = true;
+                break;
             }
         }
 
         // accept only if we got within a loose multiple of the target;
         // otherwise report failure so the caller's numerical-error paths
-        // (scaling switch, best-iterate fallback) engage
-        let loose = target * (1e6).as_T();
+        // (revert to the direct solver, scaling switch, best-iterate) engage
+        let loose = target * ACCEPT_FACTOR.as_T();
         let success = norme.is_finite() && norme <= loose;
+        self.timing[7] += t_solve.elapsed().as_secs_f64();
+        self.degraded = !success;
+        if debug {
+            eprintln!(
+                "condensed solve done: success={} stalled={} steps={} ratio={:?} norme={:?} target={:?}",
+                success, stalled, steps, (norme / target).to_f64(),
+                norme.to_f64(), target.to_f64()
+            );
+        }
 
         if success {
             if let Some(v) = lhsx {
@@ -1243,6 +1349,10 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
     fn update_A(&mut self, A: &CscMatrix<T>) {
         self.At = csc_transpose(A);
         self.A = A.clone();
+    }
+
+    fn is_degraded(&self) -> bool {
+        self.degraded
     }
 }
 
@@ -1308,3 +1418,4 @@ fn dense_lu_solve<T: FloatT>(a: &[T], piv: &[usize], k: usize, b: &mut [T]) {
         }
     }
 }
+

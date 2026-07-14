@@ -16,6 +16,13 @@ pub trait KKTSolver<T: FloatT>: HasLinearSolverInfo {
     ) -> bool;
     fn update_P(&mut self, P: &CscMatrix<T>);
     fn update_A(&mut self, A: &CscMatrix<T>);
+
+    /// True when the last solve showed that this solver's approximation of the
+    /// KKT system has degraded (e.g. iterative refinement stalled), so that the
+    /// caller should revert to a more robust solver.  Exact solvers never degrade.
+    fn is_degraded(&self) -> bool {
+        false
+    }
 }
 
 pub trait HasLinearSolverInfo {
