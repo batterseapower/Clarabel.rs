@@ -130,7 +130,6 @@ pub struct CondensedKKTSolver<T> {
     // symmetric equilibration of M_aug: everything downstream of the LDL (the
     // factor, U, Y, the core, and the solves) lives in the scaled space
     dscale: Vec<T>,
-    thick_scale: Vec<T>,
 
     // set when solves showed that the condensed operator is not an adequate
     // preconditioner for the exact KKT system (refinement could not reach
@@ -486,7 +485,6 @@ impl<T: FloatT> CondensedKKTSolver<T> {
             work_k: vec![T::zero(); k],
             static_reg: settings.static_regularization_constant,
             dscale: vec![T::one(); nn],
-            thick_scale: vec![T::zero(); n_thick],
             degraded: false,
             timing: [0.0; 8],
             n_solve_once: 0,
@@ -791,24 +789,20 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         }
         self.work_nn = rn;
         self.ldl.solve(&mut xa);
-        // U' xa.  A thick U column is a scaled row of A, so the whole thick block
-        // of this product is one A*(D o xa) gather: no need to touch U at all.
         let mut wk = std::mem::take(&mut self.work_k);
-        let mut tn = std::mem::take(&mut self.work_n);
-        for i in 0..self.n {
-            tn[i] = self.dscale[i] * xa[i];
-        }
-        let mut tm = std::mem::take(&mut self.work_m);
-        self.A_mul(&mut tm, &tn);
-        self.work_n = tn;
-        for c in 0..self.soc_col_offset {
-            wk[c] = self.thick_scale[c] * tm[self.thick_rows[c]];
-        }
-        for c in self.soc_col_offset..self.k {
+        for c in 0..self.k {
             let col = &self.U[c * self.nn..(c + 1) * self.nn];
             let mut acc = T::zero();
-            for (ci, xi) in zip(col, xa.iter()) {
-                acc += *ci * *xi;
+            if c < self.soc_col_offset {
+                let r = self.thick_rows[c];
+                for j in self.At.colptr[r]..self.At.colptr[r + 1] {
+                    let idx = self.At.rowval[j];
+                    acc += col[idx] * xa[idx];
+                }
+            } else {
+                for (ci, xi) in zip(col, xa.iter()) {
+                    acc += *ci * *xi;
+                }
             }
             wk[c] = acc;
         }
@@ -818,27 +812,21 @@ impl<T: FloatT> CondensedKKTSolver<T> {
         // the dense Y = M_sp^{-1} U keeps the whole solve in the sparse factors:
         // U's thick columns are constraint rows, so scattering them costs far
         // less than streaming the (nn x k) dense Y for every solve.
-        // U wk, again through A' rather than U: place the scaled weights on the
-        // thick rows and gather.  The equality rows of U are zero, so the tail of
-        // uw stays zero and only the SOC columns need the dense path.
         let mut uw = std::mem::take(&mut self.work_nn);
         uw.fill(T::zero());
-        tm.fill(T::zero());
-        for c in 0..self.soc_col_offset {
-            tm[self.thick_rows[c]] = self.thick_scale[c] * wk[c];
-        }
-        let mut tn = std::mem::take(&mut self.work_n);
-        self.At_mul(&mut tn, &tm);
-        self.work_m = tm;
-        for i in 0..self.n {
-            uw[i] = self.dscale[i] * tn[i];
-        }
-        self.work_n = tn;
-        for c in self.soc_col_offset..self.k {
+        for c in 0..self.k {
             let w = wk[c];
             let col = &self.U[c * self.nn..(c + 1) * self.nn];
-            for (u, o) in zip(col, uw.iter_mut()) {
-                *o += *u * w;
+            if c < self.soc_col_offset {
+                let r = self.thick_rows[c];
+                for j in self.At.colptr[r]..self.At.colptr[r + 1] {
+                    let idx = self.At.rowval[j];
+                    uw[idx] += col[idx] * w;
+                }
+            } else {
+                for (u, o) in zip(col, uw.iter_mut()) {
+                    *o += *u * w;
+                }
             }
         }
         self.ldl.solve(&mut uw);
@@ -987,7 +975,6 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
                 col[idx] *= inv * dscale[idx];
             }
             self.thick_col_scale[uc] = cs;
-            self.thick_scale[uc] = sc * inv;
         }
 
         // sparse-SOC U column (one per SOC): g = A' (Ehat^{-1} w), normalized
