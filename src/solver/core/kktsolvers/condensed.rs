@@ -34,7 +34,7 @@ use std::ops::Range;
 // rows with at most this many nonzeros contribute to M_sp; everything else
 // goes into the low-rank block (medium-density rows such as industry
 // exposures MUST be low-rank, else M_sp fills with their row-clique products)
-const THIN_ROW_NNZ: usize = 8;
+const THIN_ROW_NNZ: usize = 24;
 
 // bail out (falling back to direct LDL) if the low-rank block gets too big
 const MAX_RANK_FRACTION: f64 = 0.05;
@@ -143,7 +143,7 @@ pub struct CondensedKKTSolver<T> {
 // target; otherwise the condensed form is not good enough for this problem and
 // the caller reverts to the direct solver.
 const REFINE_CONTRACTION: f64 = 0.5;
-const ACCEPT_FACTOR: f64 = 1e6;
+const ACCEPT_FACTOR: f64 = 1e3;
 
 fn csc_transpose<T: FloatT>(A: &CscMatrix<T>) -> CscMatrix<T> {
     let (m, n) = (A.m, A.n);
@@ -1319,7 +1319,11 @@ impl<T: FloatT> KKTSolver<T> for CondensedKKTSolver<T> {
         // accept only if we got within a loose multiple of the target;
         // otherwise report failure so the caller's numerical-error paths
         // (revert to the direct solver, scaling switch, best-iterate) engage
-        let loose = target * ACCEPT_FACTOR.as_T();
+        let accept_factor = std::env::var("CLARABEL_CONDENSED_ACCEPT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(ACCEPT_FACTOR);
+        let loose = target * accept_factor.as_T();
         let success = norme.is_finite() && norme <= loose;
         self.timing[7] += t_solve.elapsed().as_secs_f64();
         self.degraded = !success;
