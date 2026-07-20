@@ -114,13 +114,15 @@ struct RefinementWorkspace<T> {
 // sparse dot products -- one contiguous pass over the values, gathered
 // reads of x, and an accumulator in a register.
 //
-// `triu_to_sym` maps each nonzero of the upper-triangular source to its
-// position(s) here: an off-diagonal entry appears twice (both are listed),
-// a diagonal entry once (both entries of the pair are the same index).
+// `sym_to_triu` gives, for each nonzero here, the index of the
+// upper-triangular source entry it takes its value from: an off-diagonal
+// source is referenced twice (once per triangle), a diagonal source once.
+// Mapping this direction rather than source-to-destination makes the value
+// refresh a gather with sequential stores instead of a scatter.
 #[derive(Debug)]
 struct SymmetricCopy<T> {
     A: CscMatrix<T>,
-    triu_to_sym: Vec<(u32, u32)>,
+    sym_to_triu: Vec<u32>,
 }
 
 // Builds the both-triangles copy and the value map from an upper
@@ -160,21 +162,20 @@ fn _build_symmetric_copy<T: FloatT>(triu: &CscMatrix<T>) -> Option<SymmetricCopy
 
     let mut rowval = vec![0usize; nnz_sym];
     let mut next = colptr[0..n].to_vec();
-    let mut triu_to_sym = vec![(0u32, 0u32); nnz_triu];
+    let mut sym_to_triu = vec![0u32; nnz_sym];
     for j in 0..n {
         let base = triu.colptr[j];
         for (t, &i) in triu.rowval[base..triu.colptr[j + 1]].iter().enumerate() {
             let k = base + t;
             let pj = next[j];
             rowval[pj] = i;
+            sym_to_triu[pj] = k as u32;
             next[j] += 1;
-            if i == j {
-                triu_to_sym[k] = (pj as u32, pj as u32);
-            } else {
+            if i != j {
                 let pi = next[i];
                 rowval[pi] = j;
+                sym_to_triu[pi] = k as u32;
                 next[i] += 1;
-                triu_to_sym[k] = (pj as u32, pi as u32);
             }
         }
     }
@@ -186,7 +187,7 @@ fn _build_symmetric_copy<T: FloatT>(triu: &CscMatrix<T>) -> Option<SymmetricCopy
         rowval,
         nzval: vec![T::zero(); nnz_sym],
     };
-    Some(SymmetricCopy { A, triu_to_sym })
+    Some(SymmetricCopy { A, sym_to_triu })
 }
 
 // Computes e = b - Ax for symmetric A held in both-triangles form,
@@ -329,9 +330,9 @@ where
         }
         if self.sym_stale {
             if let Some(sym) = &mut self.sym {
-                for (&(p1, p2), &v) in zip(&sym.triu_to_sym, &self.workspace.triuA.nzval) {
-                    sym.A.nzval[p1 as usize] = v;
-                    sym.A.nzval[p2 as usize] = v;
+                let src = &self.workspace.triuA.nzval;
+                for (dst, &k) in zip(&mut sym.A.nzval, &sym.sym_to_triu) {
+                    *dst = src[k as usize];
                 }
             }
             self.sym_stale = false;

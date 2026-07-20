@@ -329,9 +329,8 @@ fn test_symmetric_copy_exact_on_integer_data() {
     };
 
     let mut sym = _build_symmetric_copy(&triu).unwrap();
-    for (&(p1, p2), &v) in zip(&sym.triu_to_sym, &triu.nzval) {
-        sym.A.nzval[p1 as usize] = v;
-        sym.A.nzval[p2 as usize] = v;
+    for (dst, &k) in zip(&mut sym.A.nzval, &sym.sym_to_triu) {
+        *dst = triu.nzval[k as usize];
     }
     // 4 diagonal entries, 4 off-diagonal mirrored
     assert_eq!(sym.A.nzval.len(), 2 * 8 - 4);
@@ -364,9 +363,8 @@ fn test_symmetric_copy_matches_triangular_symv() {
     // the permuted internal matrix, and its both-triangles copy
     let triu = &factors.workspace.triuA;
     let mut sym = _build_symmetric_copy(triu).unwrap();
-    for (&(p1, p2), &v) in zip(&sym.triu_to_sym, &triu.nzval) {
-        sym.A.nzval[p1 as usize] = v;
-        sym.A.nzval[p2 as usize] = v;
+    for (dst, &k) in zip(&mut sym.A.nzval, &sym.sym_to_triu) {
+        *dst = triu.nzval[k as usize];
     }
 
     let n = triu.ncols();
