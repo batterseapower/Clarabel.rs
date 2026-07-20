@@ -301,6 +301,44 @@ fn _csc_axpby_N<T: FloatT>(A: &CscMatrix<T>, y: &mut [T], x: &[T], a: T, b: T) {
 
 // sparse matrix-vector multiply, transposed
 #[allow(non_snake_case)]
+// Computes yn = -Aᵀ z and ym = ym + A x in a single pass over A.
+//
+// The interior-point residual update needs both products on every
+// iteration (`rx_inf = -Aᵀz` and `rz_inf = s + Ax`), and each one on its
+// own streams all of A's indices and values.   Fusing them halves that
+// traffic: for each nonzero (i,j,v) the same load of `v` and `rowval[k]`
+// serves the column accumulation of Aᵀz and the scatter of Ax.
+//
+// Both loops here visit columns in order and entries within a column in
+// order, exactly as `_csc_axpby_T` and `_csc_axpby_N` do, so each output
+// accumulates in the same sequence as the separate calls and the results
+// are bit-identical to them.
+pub(crate) fn _csc_neg_At_and_A<T: FloatT>(
+    A: &CscMatrix<T>,
+    yn: &mut [T],
+    ym: &mut [T],
+    z: &[T],
+    x: &[T],
+) {
+    assert_eq!(A.nzval.len(), *A.colptr.last().unwrap());
+    assert_eq!(yn.len(), A.n);
+    assert_eq!(x.len(), A.n);
+    assert_eq!(ym.len(), A.m);
+    assert_eq!(z.len(), A.m);
+
+    for (j, ynj) in yn.iter_mut().enumerate().take(A.n) {
+        let xj = x[j];
+        let mut acc = T::zero();
+        for k in A.colptr[j]..A.colptr[j + 1] {
+            let i = A.rowval[k];
+            let v = A.nzval[k];
+            acc -= v * z[i];
+            ym[i] += v * xj;
+        }
+        *ynj = acc;
+    }
+}
+
 fn _csc_axpby_T<T: FloatT>(A: &CscMatrix<T>, y: &mut [T], x: &[T], a: T, b: T) {
     //first do the b*y part
     if b.is_zero() {
@@ -340,6 +378,34 @@ fn _csc_axpby_T<T: FloatT>(A: &CscMatrix<T>, y: &mut [T], x: &[T], a: T, b: T) {
             }
         }
     }
+}
+
+#[test]
+fn test_csc_neg_At_and_A_matches_separate_gemvs() {
+    // 4x3 matrix with a mix of empty and multi-entry columns
+    let A = CscMatrix {
+        m: 4,
+        n: 3,
+        colptr: vec![0, 2, 2, 5],
+        rowval: vec![0, 3, 1, 2, 3],
+        nzval: vec![2.0, -1.5, 3.0, 0.25, -4.0],
+    };
+    let x = [1.5, -2.0, 0.75];
+    let z = [3.0, -1.0, 2.5, 0.5];
+    let s = [10.0, 20.0, 30.0, 40.0];
+
+    // reference: the two separate calls this fuses
+    let mut yn_ref = vec![0.0; 3];
+    _csc_axpby_T(&A, &mut yn_ref, &z, -1.0, 0.0);
+    let mut ym_ref = s.to_vec();
+    _csc_axpby_N(&A, &mut ym_ref, &x, 1.0, 1.0);
+
+    let mut yn = vec![0.0; 3];
+    let mut ym = s.to_vec();
+    _csc_neg_At_and_A(&A, &mut yn, &mut ym, &z, &x);
+
+    assert_eq!(yn, yn_ref); // bitwise
+    assert_eq!(ym, ym_ref);
 }
 
 #[test]

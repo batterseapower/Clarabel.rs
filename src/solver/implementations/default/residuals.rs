@@ -81,15 +81,20 @@ where
         //partial residual calc so we can check primal/dual
         //infeasibility conditions
 
-        //Same as:
-        //rx_inf .= -data.A'* variables.z
-        let At = data.A.t();
-        At.gemv(&mut self.rx_inf, &variables.z, -T::one(), T::zero());
-
-        //Same as:  residuals.rz_inf .=  data.A * variables.x + variables.s
+        // Same as:
+        //   rx_inf .= -data.A' * variables.z
+        //   rz_inf .=  data.A  * variables.x + variables.s
+        // computed together in one pass over A, which halves the index and
+        // value traffic; the accumulation order of each output matches the
+        // separate gemv calls, so the results are unchanged.
         self.rz_inf.copy_from(&variables.s);
-        let A = &data.A;
-        A.gemv(&mut self.rz_inf, &variables.x, T::one(), T::one());
+        _csc_neg_At_and_A(
+            &data.A,
+            &mut self.rx_inf,
+            &mut self.rz_inf,
+            &variables.z,
+            &variables.x,
+        );
 
         //complete the residuals
         //rx = rx_inf - Px - qτ
