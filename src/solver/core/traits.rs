@@ -207,10 +207,20 @@ where
     /// Return `true` if termination conditions have been reached.
     fn check_termination(&mut self, residuals: &Self::R, settings: &Self::SE, iter: u32) -> bool;
 
-    /// save a prior iterate
-    fn save_prev_iterate(&mut self, variables: &Self::V, prev_variables: &mut Self::V);
-    /// restore a prior iterate
-    fn reset_to_prev_iterate(&mut self, variables: &mut Self::V, prev_variables: &Self::V);
+    /// Record the current iterate's scalars for the next iteration's
+    /// progress checks, and checkpoint the iterate itself (into
+    /// `best_variables`) if it is the best seen so far by the
+    /// termination-criteria merit.
+    fn checkpoint_iterate(
+        &mut self,
+        variables: &Self::V,
+        best_variables: &mut Self::V,
+        settings: &Self::SE,
+    );
+    /// Restore the best checkpointed iterate, if one exists and the
+    /// current iterate is not trending towards an infeasibility
+    /// certificate.  Returns true if the restore was performed.
+    fn reset_to_best_iterate(&mut self, variables: &mut Self::V, best_variables: &Self::V) -> bool;
 
     /// Record some of the top level solver's choice of various
     /// scalars. `μ = ` normalized gap.  `α = ` computed step length.

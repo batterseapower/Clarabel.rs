@@ -132,7 +132,7 @@ where
     pub cones: C,
     pub step_lhs: V,
     pub step_rhs: V,
-    pub prev_vars: V,
+    pub best_vars: V,
     pub info: I,
     pub solution: SO,
     pub(crate) settings: SE, // not public to avoid unchecked modifications
@@ -426,8 +426,9 @@ where
                 StrategyCheckpoint::Fail => {α = T::zero(); break}
             }
 
-            // Copy previous iterate in case the next one is a dud
-            self.info.save_prev_iterate(&self.variables,&mut self.prev_vars);
+            // Record progress scalars, and checkpoint this iterate if it
+            // is the best seen so far (restored should the solve fail)
+            self.info.checkpoint_iterate(&self.variables,&mut self.best_vars,&self.settings);
 
             self.variables.add_step(&self.step_lhs, α);
 
@@ -447,6 +448,17 @@ where
         }
 
         timeit! {timers => "post-process"; {
+            // if the solver failed, report the best iterate seen rather
+            // than the point at which it gave up (unless the final iterate
+            // is trending towards an infeasibility certificate).   The
+            // "almost" convergence check below is then evaluated against
+            // the restored iterate.
+            if self.info.get_status().is_errored()
+                || matches!(self.info.get_status(), SolverStatus::MaxIterations | SolverStatus::MaxTime)
+            {
+                self.info.reset_to_best_iterate(&mut self.variables, &self.best_vars);
+            }
+
             //check for "almost" convergence case and then extract solution
             self.info.post_process(&self.residuals, &self.settings);
             self.solution
@@ -592,10 +604,10 @@ mod internal {
                 // there is no problem, so nothing to do
                 output = StrategyCheckpoint::NoUpdate;
             } else {
-                // recover old iterate since "insufficient progress" often
-                // involves actual degradation of results
+                // recover the best iterate since "insufficient progress"
+                // often involves actual degradation of results
                 self.info
-                    .reset_to_prev_iterate(&mut self.variables, &self.prev_vars);
+                    .reset_to_best_iterate(&mut self.variables, &self.best_vars);
 
                 // If problem is asymmetric, we can try to continue with the dual-only strategy
                 if !self.cones.is_symmetric() && (scaling == ScalingStrategy::PrimalDual) {

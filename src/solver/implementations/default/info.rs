@@ -51,6 +51,27 @@ pub struct DefaultInfo<T> {
     pub(crate) prev_gap_abs: T,
     /// relative duality gap from previous iteration
     pub(crate) prev_gap_rel: T,
+
+    // best iterate seen so far, by termination-criteria merit.
+    // Restored on solver failure so that the reported solution is
+    // the best one encountered rather than the point at which the
+    // solver gave up.   `best_merit` is ∞ until a checkpoint is taken.
+    /// merit of the best iterate (∞ if none yet checkpointed)
+    pub(crate) best_merit: T,
+    /// primal objective value at the best iterate
+    pub(crate) best_cost_primal: T,
+    /// dual objective value at the best iterate
+    pub(crate) best_cost_dual: T,
+    /// primal residual at the best iterate
+    pub(crate) best_res_primal: T,
+    /// dual residual at the best iterate
+    pub(crate) best_res_dual: T,
+    /// absolute duality gap at the best iterate
+    pub(crate) best_gap_abs: T,
+    /// relative duality gap at the best iterate
+    pub(crate) best_gap_rel: T,
+    /// κ/τ ratio at the best iterate
+    pub(crate) best_ktratio: T,
     /// solve time
     pub solve_time: f64,
     /// solver status
@@ -88,6 +109,7 @@ where
         self.status = SolverStatus::Unsolved;
         self.iterations = 0;
         self.solve_time = 0f64;
+        self.best_merit = T::infinity();
 
         timers.reset_timer("solve");
     }
@@ -230,7 +252,14 @@ where
         self.status != SolverStatus::Unsolved
     }
 
-    fn save_prev_iterate(&mut self, variables: &Self::V, prev_variables: &mut Self::V) {
+    fn checkpoint_iterate(
+        &mut self,
+        variables: &Self::V,
+        best_variables: &mut Self::V,
+        settings: &DefaultSettings<T>,
+    ) {
+        // scalars from the previous iteration, used by the
+        // poor-progress tests in check_termination
         self.prev_cost_primal = self.cost_primal;
         self.prev_cost_dual = self.cost_dual;
         self.prev_res_primal = self.res_primal;
@@ -238,18 +267,46 @@ where
         self.prev_gap_abs = self.gap_abs;
         self.prev_gap_rel = self.gap_rel;
 
-        prev_variables.copy_from(variables);
+        // Additionally checkpoint the iterate itself if it is the best
+        // seen so far, so that a failed solve can still report the best
+        // point encountered rather than the one at which it gave up.
+        // Only iterates on the optimality branch (κ/τ ≤ 1) are candidates:
+        // for κ/τ > 1 the iterate is trending towards an infeasibility
+        // certificate and its cost/gap values are not meaningful.
+        if self.ktratio <= T::one() {
+            let merit = self.termination_merit(settings);
+            if merit.is_finite() && merit < self.best_merit {
+                self.best_merit = merit;
+                self.best_cost_primal = self.cost_primal;
+                self.best_cost_dual = self.cost_dual;
+                self.best_res_primal = self.res_primal;
+                self.best_res_dual = self.res_dual;
+                self.best_gap_abs = self.gap_abs;
+                self.best_gap_rel = self.gap_rel;
+                self.best_ktratio = self.ktratio;
+                best_variables.copy_from(variables);
+            }
+        }
     }
 
-    fn reset_to_prev_iterate(&mut self, variables: &mut Self::V, prev_variables: &Self::V) {
-        self.cost_primal = self.prev_cost_primal;
-        self.cost_dual = self.prev_cost_dual;
-        self.res_primal = self.prev_res_primal;
-        self.res_dual = self.prev_res_dual;
-        self.gap_abs = self.prev_gap_abs;
-        self.gap_rel = self.prev_gap_rel;
+    fn reset_to_best_iterate(&mut self, variables: &mut Self::V, best_variables: &Self::V) -> bool {
+        // nothing to restore if no iterate was ever checkpointed.   If the
+        // current iterate has κ/τ > 1 it is trending towards an
+        // infeasibility certificate, which a restore would mask, so keep it.
+        if !self.best_merit.is_finite() || self.ktratio > T::one() {
+            return false;
+        }
 
-        variables.copy_from(prev_variables);
+        self.cost_primal = self.best_cost_primal;
+        self.cost_dual = self.best_cost_dual;
+        self.res_primal = self.best_res_primal;
+        self.res_dual = self.best_res_dual;
+        self.gap_abs = self.best_gap_abs;
+        self.gap_rel = self.best_gap_rel;
+        self.ktratio = self.best_ktratio;
+
+        variables.copy_from(best_variables);
+        true
     }
 
     fn save_scalars(&mut self, μ: T, α: T, σ: T, iter: u32) {
@@ -368,6 +425,23 @@ where
             && (self.res_dual < tol_feas)
     }
 
+    // Distance of the current iterate from satisfying the full-accuracy
+    // `is_solved` test: each termination quantity normalized by its
+    // tolerance, combined exactly as in that test (the duality gap counts
+    // via whichever of its absolute/relative forms is closer to passing).
+    // An iterate with merit < 1 would terminate as Solved.
+    fn termination_merit(&self, settings: &DefaultSettings<T>) -> T {
+        let gap = T::min(
+            self.gap_abs / settings.tol_gap_abs,
+            self.gap_rel / settings.tol_gap_rel,
+        );
+        let feas = T::max(
+            self.res_primal / settings.tol_feas,
+            self.res_dual / settings.tol_feas,
+        );
+        T::max(gap, feas)
+    }
+
     fn is_primal_infeasible(
         &self,
         residuals: &DefaultResiduals<T>,
@@ -386,5 +460,93 @@ where
     ) -> bool {
         (residuals.dot_qx < -tol_infeas_abs)
             && (self.res_dual_inf < -tol_infeas_rel * residuals.dot_qx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// best-iterate checkpointing tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::solver::core::traits::Info;
+
+    // gives an info with the stated termination quantities and κ/τ,
+    // with best_merit initialized as at the start of a solve
+    fn info_with(res: f64, gap: f64, ktratio: f64) -> DefaultInfo<f64> {
+        let mut info = DefaultInfo::<f64>::default();
+        info.best_merit = f64::INFINITY;
+        info.res_primal = res;
+        info.res_dual = res;
+        info.gap_abs = gap;
+        info.gap_rel = gap;
+        info.ktratio = ktratio;
+        info
+    }
+
+    fn set_current(info: &mut DefaultInfo<f64>, res: f64, gap: f64, ktratio: f64) {
+        info.res_primal = res;
+        info.res_dual = res;
+        info.gap_abs = gap;
+        info.gap_rel = gap;
+        info.ktratio = ktratio;
+    }
+
+    #[test]
+    fn test_best_iterate_checkpoint_and_restore() {
+        let settings = DefaultSettings::<f64>::default();
+        let mut info = info_with(1e-3, 1e-3, 0.5);
+        let mut best = DefaultVariables::<f64>::new(2, 1);
+        let mut vars = DefaultVariables::<f64>::new(2, 1);
+
+        // first candidate is checkpointed
+        vars.x[0] = 1.0;
+        info.cost_primal = 10.0;
+        info.checkpoint_iterate(&vars, &mut best, &settings);
+        assert_eq!(best.x[0], 1.0);
+
+        // a worse iterate is not
+        set_current(&mut info, 1e-2, 1e-2, 0.5);
+        vars.x[0] = 2.0;
+        info.checkpoint_iterate(&vars, &mut best, &settings);
+        assert_eq!(best.x[0], 1.0);
+
+        // a better one is
+        set_current(&mut info, 1e-6, 1e-6, 0.5);
+        vars.x[0] = 3.0;
+        info.cost_primal = 30.0;
+        info.checkpoint_iterate(&vars, &mut best, &settings);
+        assert_eq!(best.x[0], 3.0);
+
+        // an infeasibility-trending iterate is never a candidate,
+        // however good its (meaningless) residuals look
+        set_current(&mut info, 1e-9, 1e-9, 2.0);
+        vars.x[0] = 4.0;
+        info.checkpoint_iterate(&vars, &mut best, &settings);
+        assert_eq!(best.x[0], 3.0);
+
+        // restore declines while the current iterate trends infeasible...
+        assert!(!info.reset_to_best_iterate(&mut vars, &best));
+        assert_eq!(vars.x[0], 4.0);
+
+        // ...and otherwise restores the checkpointed variables and scalars
+        set_current(&mut info, 1e-1, 1e-1, 0.5);
+        info.cost_primal = 99.0;
+        assert!(info.reset_to_best_iterate(&mut vars, &best));
+        assert_eq!(vars.x[0], 3.0);
+        assert_eq!(info.cost_primal, 30.0);
+        assert_eq!(info.res_primal, 1e-6);
+    }
+
+    #[test]
+    fn test_best_iterate_no_checkpoint_no_restore() {
+        let mut info = info_with(1e-3, 1e-3, 0.5);
+        info.best_merit = f64::INFINITY; // nothing checkpointed
+        let best = DefaultVariables::<f64>::new(2, 1);
+        let mut vars = DefaultVariables::<f64>::new(2, 1);
+        vars.x[0] = 7.0;
+        assert!(!info.reset_to_best_iterate(&mut vars, &best));
+        assert_eq!(vars.x[0], 7.0);
     }
 }
