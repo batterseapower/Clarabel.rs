@@ -87,6 +87,11 @@ pub struct QDLDLFactorisation<T = f64> {
     is_symbolic: bool,
     /// workspace for `solve_refined`, allocated on first use
     ir_work: Option<RefinementWorkspace<T>>,
+    /// both-triangles copy of the internal matrix, for refinement
+    /// residuals; built on first use and refreshed when values change
+    sym: Option<SymmetricCopy<T>>,
+    /// true when `sym`'s values are stale w.r.t. the internal matrix
+    sym_stale: bool,
 }
 
 // working vectors for solve_refined, all in permuted coordinates
@@ -95,6 +100,135 @@ struct RefinementWorkspace<T> {
     x: Vec<T>,  // current solution
     dx: Vec<T>, // refinement step / trial solution
     e: Vec<T>,  // residual
+}
+
+// A full (both triangles) copy of the internally permuted matrix.
+//
+// Refinement residuals `e = b - Ax` were computed from the upper triangle
+// alone, which requires exploiting symmetry with two scattered
+// read-modify-writes per off-diagonal nonzero (into `y[row]` and
+// `y[col]`).   Holding both triangles instead costs about twice the memory
+// but removes the scatter entirely: because A is symmetric, its CSC arrays
+// read as CSR describe the same matrix, so row i of A is exactly what is
+// stored as "column i".   The residual is then a sequence of independent
+// sparse dot products -- one contiguous pass over the values, gathered
+// reads of x, and an accumulator in a register.
+//
+// `triu_to_sym` maps each nonzero of the upper-triangular source to its
+// position(s) here: an off-diagonal entry appears twice (both are listed),
+// a diagonal entry once (both entries of the pair are the same index).
+#[derive(Debug)]
+struct SymmetricCopy<T> {
+    A: CscMatrix<T>,
+    triu_to_sym: Vec<(u32, u32)>,
+}
+
+// Builds the both-triangles copy and the value map from an upper
+// triangular source.   Returns None if the pattern is too large for the
+// u32 index map, in which case refinement falls back to the triangular
+// symmetric matrix-vector product.
+fn _build_symmetric_copy<T: FloatT>(triu: &CscMatrix<T>) -> Option<SymmetricCopy<T>> {
+    let n = triu.ncols();
+    let nnz_triu = triu.nzval.len();
+    let mut ndiag = 0;
+    for j in 0..n {
+        for &i in &triu.rowval[triu.colptr[j]..triu.colptr[j + 1]] {
+            if i == j {
+                ndiag += 1;
+            }
+        }
+    }
+    let nnz_sym = 2 * nnz_triu - ndiag;
+    if nnz_sym >= u32::MAX as usize {
+        return None;
+    }
+
+    // column counts: entry (i,j), i <= j, lands in column j and, when
+    // off-diagonal, also in column i
+    let mut colptr = vec![0usize; n + 1];
+    for j in 0..n {
+        for &i in &triu.rowval[triu.colptr[j]..triu.colptr[j + 1]] {
+            colptr[j + 1] += 1;
+            if i != j {
+                colptr[i + 1] += 1;
+            }
+        }
+    }
+    for j in 0..n {
+        colptr[j + 1] += colptr[j];
+    }
+
+    let mut rowval = vec![0usize; nnz_sym];
+    let mut next = colptr[0..n].to_vec();
+    let mut triu_to_sym = vec![(0u32, 0u32); nnz_triu];
+    for j in 0..n {
+        let base = triu.colptr[j];
+        for (t, &i) in triu.rowval[base..triu.colptr[j + 1]].iter().enumerate() {
+            let k = base + t;
+            let pj = next[j];
+            rowval[pj] = i;
+            next[j] += 1;
+            if i == j {
+                triu_to_sym[k] = (pj as u32, pj as u32);
+            } else {
+                let pi = next[i];
+                rowval[pi] = j;
+                next[i] += 1;
+                triu_to_sym[k] = (pj as u32, pi as u32);
+            }
+        }
+    }
+
+    let A = CscMatrix {
+        m: n,
+        n,
+        colptr,
+        rowval,
+        nzval: vec![T::zero(); nnz_sym],
+    };
+    Some(SymmetricCopy { A, triu_to_sym })
+}
+
+// Computes e = b - Ax for symmetric A held in both-triangles form,
+// reading its CSC arrays as CSR (valid because A = Aᵀ), and returns
+// ||e||_∞.   Each row is an independent sparse dot product.
+//
+// The loop is memory bound -- one streamed value and one gathered x per
+// nonzero -- so the accumulators stay in registers.  Four are used and
+// reduced pairwise: a single accumulator serializes each row on the
+// latency of one dependent add, while independent partial sums also carry
+// a slightly tighter error bound than sequential summation (Higham,
+// "Accuracy and Stability of Numerical Algorithms", 2nd ed., 2002, §4.2,
+// on blocked and pairwise summation).
+fn _sym_residual<T: FloatT>(sym: &SymmetricCopy<T>, e: &mut [T], b: &[T], x: &[T]) -> T {
+    let (colptr, rowval, nzval) = (&sym.A.colptr, &sym.A.rowval, &sym.A.nzval);
+    let mut norme = T::zero();
+    for (i, ei) in e.iter_mut().enumerate() {
+        let (f, l) = (colptr[i], colptr[i + 1]);
+        let (vals, cols) = (&nzval[f..l], &rowval[f..l]);
+        let nchunk = vals.len() / 4;
+
+        let mut s = [T::zero(); 4];
+        unsafe {
+            // Safety: rowval entries are column indices of a matrix with
+            // the same dimension as x, as built by _build_symmetric_copy.
+            for c in 0..nchunk {
+                let (v, k) = (&vals[4 * c..4 * c + 4], &cols[4 * c..4 * c + 4]);
+                s[0] += v[0] * *x.get_unchecked(k[0]);
+                s[1] += v[1] * *x.get_unchecked(k[1]);
+                s[2] += v[2] * *x.get_unchecked(k[2]);
+                s[3] += v[3] * *x.get_unchecked(k[3]);
+            }
+            for t in 4 * nchunk..vals.len() {
+                s[t & 3] += vals[t] * *x.get_unchecked(cols[t]);
+            }
+        }
+
+        let ri = b[i] - ((s[0] + s[1]) + (s[2] + s[3]));
+        *ei = ri;
+        norme = T::max(norme, T::abs(ri));
+    }
+    norme
 }
 
 impl<T> QDLDLFactorisation<T>
@@ -178,6 +312,23 @@ where
         assert_eq!(x.len(), self.D.len());
 
         let n = self.D.len();
+
+        // build the both-triangles copy on first use, and refresh its
+        // values whenever the internal matrix has been modified since
+        if self.sym.is_none() {
+            self.sym = _build_symmetric_copy(&self.workspace.triuA);
+            self.sym_stale = true;
+        }
+        if self.sym_stale {
+            if let Some(sym) = &mut self.sym {
+                for (&(p1, p2), &v) in zip(&sym.triu_to_sym, &self.workspace.triuA.nzval) {
+                    sym.A.nzval[p1 as usize] = v;
+                    sym.A.nzval[p2 as usize] = v;
+                }
+            }
+            self.sym_stale = false;
+        }
+
         let work = self.ir_work.get_or_insert_with(|| RefinementWorkspace {
             x: vec![T::zero(); n],
             dx: vec![T::zero(); n],
@@ -197,11 +348,19 @@ where
         xp.copy_from(bp);
         _solve(Lp, Li, Lx, &self.Dinv, xp);
 
-        // computes e = bp - A*ξ and returns its norm
+        // computes e = bp - A*ξ and returns its norm.  Prefers the
+        // both-triangles copy (a pure gather; see `SymmetricCopy`), and
+        // falls back to the triangular symv if that copy is unavailable.
+        let sym = self.sym.as_ref();
         let refine_error = |e: &mut [T], ξ: &[T]| -> T {
-            e.copy_from(bp);
-            Asym.symv(e, ξ, -T::one(), T::one());
-            e.norm_inf()
+            match sym {
+                Some(sym) => _sym_residual(sym, e, bp, ξ),
+                None => {
+                    e.copy_from(bp);
+                    Asym.symv(e, ξ, -T::one(), T::one());
+                    e.norm_inf()
+                }
+            }
         };
 
         let (e, dx) = (&mut work.e, &mut work.dx);
@@ -246,6 +405,7 @@ where
     /// Update a subset of the values of the matrix to be (re)factored.  See [`refactor`](crate::qdldl::QDLDLFactorisation::refactor)
     ///
     pub fn update_values(&mut self, indices: &[usize], values: &[T]) {
+        self.sym_stale = true;
         let nzval = &mut self.workspace.triuA.nzval; // post perm internal data
         let AtoPAPt = &self.workspace.AtoPAPt; //mapping from input matrix entries to triuA
 
@@ -257,6 +417,7 @@ where
     /// Update a subset of the values of the matrix to be (re)factored.  See [`refactor`](crate::qdldl::QDLDLFactorisation::refactor)
     ///
     pub fn scale_values(&mut self, indices: &[usize], scale: T) {
+        self.sym_stale = true;
         let nzval = &mut self.workspace.triuA.nzval; // post perm internal data
         let AtoPAPt = &self.workspace.AtoPAPt; //mapping from input matrix entries to triuA
 
@@ -270,6 +431,7 @@ where
     /// indicating the direction of shifts. See [`refactor`](crate::qdldl::QDLDLFactorisation::refactor)
     ///
     pub fn offset_values(&mut self, indices: &[usize], offset: T, signs: &[i8]) {
+        self.sym_stale = true;
         assert_eq!(indices.len(), signs.len());
 
         let nzval = &mut self.workspace.triuA.nzval; // post perm internal data
@@ -398,6 +560,8 @@ fn _qdldl_new<T: FloatT>(
         workspace,
         is_symbolic: opts.logical,
         ir_work: None,
+        sym: None,
+        sym_stale: true,
     })
 }
 
