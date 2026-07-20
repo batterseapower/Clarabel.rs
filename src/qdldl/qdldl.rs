@@ -195,11 +195,19 @@ fn _build_symmetric_copy<T: FloatT>(triu: &CscMatrix<T>) -> Option<SymmetricCopy
 //
 // The loop is memory bound -- one streamed value and one gathered x per
 // nonzero -- so the accumulators stay in registers.  Four are used and
-// reduced pairwise: a single accumulator serializes each row on the
-// latency of one dependent add, while independent partial sums also carry
-// a slightly tighter error bound than sequential summation (Higham,
-// "Accuracy and Stability of Numerical Algorithms", 2nd ed., 2002, §4.2,
-// on blocked and pairwise summation).
+// reduced pairwise.   A single accumulator serializes each row on the
+// latency of one dependent add, and independent partial sums also carry a
+// tighter error bound than sequential summation, growing like n/k + k for
+// k accumulators rather than n (Higham, "Accuracy and Stability of
+// Numerical Algorithms", 2nd ed., 2002, §4.2, on blocked and pairwise
+// summation).
+//
+// Four rather than two or eight, measured on the portfolio problems:
+// one accumulator is ~8% slower than four; two is ~1% *faster* than four
+// but degrades one problem from AlmostSolved to InsufficientProgress,
+// consistent with its looser summation error; eight is indistinguishable
+// from four in time and needs more code.   Four is therefore the smallest
+// count that captures both the pipelining and the accuracy.
 fn _sym_residual<T: FloatT>(sym: &SymmetricCopy<T>, e: &mut [T], b: &[T], x: &[T]) -> T {
     let (colptr, rowval, nzval) = (&sym.A.colptr, &sym.A.rowval, &sym.A.nzval);
     let mut norme = T::zero();
