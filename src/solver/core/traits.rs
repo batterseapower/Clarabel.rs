@@ -217,10 +217,16 @@ where
         best_variables: &mut Self::V,
         settings: &Self::SE,
     );
-    /// Restore the best checkpointed iterate, if one exists and the
-    /// current iterate is not trending towards an infeasibility
-    /// certificate.  Returns true if the restore was performed.
-    fn reset_to_best_iterate(&mut self, variables: &mut Self::V, best_variables: &Self::V) -> bool;
+    /// Restore the best checkpointed iterate, if one exists, is better
+    /// than the iterate currently held, and the current iterate is not
+    /// trending towards an infeasibility certificate.  Returns true if
+    /// the restore was performed.
+    fn reset_to_best_iterate(
+        &mut self,
+        variables: &mut Self::V,
+        best_variables: &Self::V,
+        settings: &Self::SE,
+    ) -> bool;
 
     /// Record some of the top level solver's choice of various
     /// scalars. `μ = ` normalized gap.  `α = ` computed step length.

@@ -289,11 +289,26 @@ where
         }
     }
 
-    fn reset_to_best_iterate(&mut self, variables: &mut Self::V, best_variables: &Self::V) -> bool {
+    fn reset_to_best_iterate(
+        &mut self,
+        variables: &mut Self::V,
+        best_variables: &Self::V,
+        settings: &DefaultSettings<T>,
+    ) -> bool {
         // nothing to restore if no iterate was ever checkpointed.   If the
         // current iterate has κ/τ > 1 it is trending towards an
         // infeasibility certificate, which a restore would mask, so keep it.
         if !self.best_merit.is_finite() || self.ktratio > T::one() {
+            return false;
+        }
+
+        // Never trade the current iterate for a worse one.   The iteration
+        // loop can exit *before* checkpointing -- an undersized step or a
+        // failed KKT solve breaks out of the loop body ahead of the
+        // checkpoint -- so the iterate held at exit is frequently better
+        // than anything stored, and restoring unconditionally would discard
+        // the best answer instead of recovering it.
+        if self.termination_merit(settings) <= self.best_merit {
             return false;
         }
 
@@ -425,19 +440,30 @@ where
             && (self.res_dual < tol_feas)
     }
 
-    // Distance of the current iterate from satisfying the full-accuracy
-    // `is_solved` test: each termination quantity normalized by its
-    // tolerance, combined exactly as in that test (the duality gap counts
-    // via whichever of its absolute/relative forms is closer to passing).
-    // An iterate with merit < 1 would terminate as Solved.
+    // Distance of the current iterate from satisfying the `is_solved`
+    // test at the *reduced* tolerances: each termination quantity
+    // normalized by its tolerance, combined exactly as in that test (the
+    // duality gap counts via whichever of its absolute/relative forms is
+    // closer to passing).  An iterate with merit < 1 satisfies the test.
+    //
+    // The reduced tolerances are the right yardstick because this merit
+    // only ever selects among iterates for an *unsuccessful* exit, where
+    // `check_convergence_almost` -- which uses exactly these tolerances --
+    // decides whether the restored iterate can still be reported as
+    // `AlmostSolved`.  Ranking by them gives a guarantee: the selected
+    // iterate has the smallest reduced merit among all candidates, so if
+    // any candidate would have passed that check, the selected one passes
+    // it too.  Normalizing by the full tolerances instead can rank an
+    // iterate that fails the reduced check above one that passes it,
+    // turning a reduced-accuracy success into a reported failure.
     fn termination_merit(&self, settings: &DefaultSettings<T>) -> T {
         let gap = T::min(
-            self.gap_abs / settings.tol_gap_abs,
-            self.gap_rel / settings.tol_gap_rel,
+            self.gap_abs / settings.reduced_tol_gap_abs,
+            self.gap_rel / settings.reduced_tol_gap_rel,
         );
         let feas = T::max(
-            self.res_primal / settings.tol_feas,
-            self.res_dual / settings.tol_feas,
+            self.res_primal / settings.reduced_tol_feas,
+            self.res_dual / settings.reduced_tol_feas,
         );
         T::max(gap, feas)
     }
@@ -527,26 +553,56 @@ mod test {
         assert_eq!(best.x[0], 3.0);
 
         // restore declines while the current iterate trends infeasible...
-        assert!(!info.reset_to_best_iterate(&mut vars, &best));
+        assert!(!info.reset_to_best_iterate(&mut vars, &best, &settings));
         assert_eq!(vars.x[0], 4.0);
 
         // ...and otherwise restores the checkpointed variables and scalars
         set_current(&mut info, 1e-1, 1e-1, 0.5);
         info.cost_primal = 99.0;
-        assert!(info.reset_to_best_iterate(&mut vars, &best));
+        assert!(info.reset_to_best_iterate(&mut vars, &best, &settings));
         assert_eq!(vars.x[0], 3.0);
         assert_eq!(info.cost_primal, 30.0);
         assert_eq!(info.res_primal, 1e-6);
     }
 
+    // The iteration loop can break before checkpointing (undersized step,
+    // failed KKT solve), so the iterate held at exit is often better than
+    // any checkpoint.   Restoring then would discard the best answer, so a
+    // restore must only happen when it is an improvement.
+    #[test]
+    fn test_best_iterate_never_restores_something_worse() {
+        let settings = DefaultSettings::<f64>::default();
+        let mut info = info_with(1e-3, 1e-3, 0.5);
+        let mut best = DefaultVariables::<f64>::new(2, 1);
+        let mut vars = DefaultVariables::<f64>::new(2, 1);
+
+        // checkpoint a mediocre iterate
+        vars.x[0] = 1.0;
+        info.checkpoint_iterate(&vars, &mut best, &settings);
+        assert_eq!(best.x[0], 1.0);
+
+        // now hold a *better* iterate that was never checkpointed
+        set_current(&mut info, 1e-9, 1e-9, 0.5);
+        vars.x[0] = 2.0;
+        assert!(!info.reset_to_best_iterate(&mut vars, &best, &settings));
+        assert_eq!(vars.x[0], 2.0); // kept, not overwritten
+
+        // but a genuinely worse current iterate is replaced
+        set_current(&mut info, 1e-1, 1e-1, 0.5);
+        vars.x[0] = 3.0;
+        assert!(info.reset_to_best_iterate(&mut vars, &best, &settings));
+        assert_eq!(vars.x[0], 1.0);
+    }
+
     #[test]
     fn test_best_iterate_no_checkpoint_no_restore() {
+        let settings = DefaultSettings::<f64>::default();
         let mut info = info_with(1e-3, 1e-3, 0.5);
         info.best_merit = f64::INFINITY; // nothing checkpointed
         let best = DefaultVariables::<f64>::new(2, 1);
         let mut vars = DefaultVariables::<f64>::new(2, 1);
         vars.x[0] = 7.0;
-        assert!(!info.reset_to_best_iterate(&mut vars, &best));
+        assert!(!info.reset_to_best_iterate(&mut vars, &best, &settings));
         assert_eq!(vars.x[0], 7.0);
     }
 }

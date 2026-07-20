@@ -456,7 +456,8 @@ where
             if self.info.get_status().is_errored()
                 || matches!(self.info.get_status(), SolverStatus::MaxIterations | SolverStatus::MaxTime)
             {
-                self.info.reset_to_best_iterate(&mut self.variables, &self.best_vars);
+                self.info
+                    .reset_to_best_iterate(&mut self.variables, &self.best_vars, &self.settings);
             }
 
             //check for "almost" convergence case and then extract solution
@@ -606,8 +607,11 @@ mod internal {
             } else {
                 // recover the best iterate since "insufficient progress"
                 // often involves actual degradation of results
-                self.info
-                    .reset_to_best_iterate(&mut self.variables, &self.best_vars);
+                self.info.reset_to_best_iterate(
+                    &mut self.variables,
+                    &self.best_vars,
+                    &self.settings,
+                );
 
                 // If problem is asymmetric, we can try to continue with the dual-only strategy
                 if !self.cones.is_symmetric() && (scaling == ScalingStrategy::PrimalDual) {
