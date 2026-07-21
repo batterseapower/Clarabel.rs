@@ -348,6 +348,35 @@ fn test_symmetric_copy_exact_on_integer_data() {
     assert_eq!(norme, inf_norm(&e_new));
 }
 
+// A non-finite solution must be reported rather than masked.  The running
+// maximum cannot see a NaN on its own, because IEEE maxNum returns the
+// non-NaN operand, so without explicit tracking a NaN residual would leave
+// the norm finite and the caller would accept a NaN solution as converged.
+#[test]
+fn test_sym_residual_reports_nan() {
+    let triu = CscMatrix {
+        m: 3,
+        n: 3,
+        colptr: vec![0, 1, 3, 6],
+        rowval: vec![0, 0, 1, 0, 1, 2],
+        nzval: vec![2.0, 1.0, 3.0, -1.0, 0.5, 4.0],
+    };
+    let mut sym = _build_symmetric_copy(&triu).unwrap();
+    for (dst, &k) in zip(&mut sym.A.nzval, &sym.sym_to_triu) {
+        *dst = triu.nzval[k as usize];
+    }
+    let b = [1.0, 2.0, 3.0];
+    let mut e = [0.0; 3];
+
+    // finite input: ordinary infinity norm
+    let n_ok: f64 = _sym_residual(&sym, &mut e, &b, &[1.0, 1.0, 1.0]);
+    assert!(n_ok.is_finite());
+
+    // one NaN in x taints its rows, and must be reported
+    let norme: f64 = _sym_residual(&sym, &mut e, &b, &[1.0, f64::NAN, 1.0]);
+    assert!(norme.is_nan(), "NaN residual must not be masked");
+}
+
 // The both-triangles copy must reproduce the matrix the triangular
 // symv represents, so that refinement residuals are unchanged in value
 // (they differ only in summation order).

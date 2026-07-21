@@ -212,6 +212,11 @@ fn _build_symmetric_copy<T: FloatT>(triu: &CscMatrix<T>) -> Option<SymmetricCopy
 fn _sym_residual<T: FloatT>(sym: &SymmetricCopy<T>, e: &mut [T], b: &[T], x: &[T]) -> T {
     let (colptr, rowval, nzval) = (&sym.A.colptr, &sym.A.rowval, &sym.A.nzval);
     let mut norme = T::zero();
+    // A NaN residual must be reported, and cannot be detected by the
+    // running maximum alone: IEEE maxNum returns the non-NaN operand, so a
+    // NaN would leave `norme` finite and let a non-finite solution be
+    // accepted as converged.   Tracked separately and folded in at the end.
+    let mut any_nan = false;
     for (i, ei) in e.iter_mut().enumerate() {
         let (f, l) = (colptr[i], colptr[i + 1]);
         let (vals, cols) = (&nzval[f..l], &rowval[f..l]);
@@ -235,7 +240,11 @@ fn _sym_residual<T: FloatT>(sym: &SymmetricCopy<T>, e: &mut [T], b: &[T], x: &[T
 
         let ri = b[i] - ((s[0] + s[1]) + (s[2] + s[3]));
         *ei = ri;
+        any_nan |= ri.is_nan();
         norme = T::max(norme, T::abs(ri));
+    }
+    if any_nan {
+        return T::nan();
     }
     norme
 }
